@@ -1,0 +1,392 @@
+package rsm
+
+import (
+	"encoding/gob"
+	"kvraft/cache"
+	kvraftapi "kvraft/raftkv/rpc"
+	"kvraft/storage"
+	"kvraft/watch"
+	"log"
+	"net"
+	"net/rpc"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ============================================================
+// KVServer - 高性能分布式键值存储服务器
+// 集成特性：LRU 缓存、Watch 实时推送、性能统计
+// ============================================================
+
+type OperationInfo struct {
+	Type       string
+	Key        string
+	OldValue   string
+	NewValue   string
+	OldVersion int64
+	NewVersion int64
+	Timestamp  time.Time
+	Success    bool
+	Error      kvraftapi.Err
+}
+
+type KVServer struct {
+	me       int
+	dead     int32
+	rsm      *RSM
+	mu       sync.RWMutex
+	store    *storage.Store
+	lruCache *cache.LRUCache
+	stats    *ServerStats
+}
+
+type ServerStats struct {
+	mu             sync.RWMutex
+	TotalRequests  int64
+	TotalWrites    int64
+	TotalReads     int64
+	FailedRequests int64
+	CacheHits      int64
+	CacheMisses    int64
+	WatchNotifies  int64
+}
+
+// ============================================================
+// 核心业务逻辑 - Do Op (执行状态机操作)
+// ============================================================
+
+func (kv *KVServer) DoOp(req any) any {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	switch t := req.(type) {
+	case *kvraftapi.GetArgs:
+		return kv.doGet(t)
+	case kvraftapi.GetArgs:
+		return kv.doGet(&t)
+	case *kvraftapi.PutArgs:
+		return kv.doPut(t)
+	case kvraftapi.PutArgs:
+		return kv.doPut(&t)
+	default:
+		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, t)
+		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+	}
+}
+
+// doGet - 读优化：缓存优先级最高
+func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
+	if kv.killed() {
+		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	// 缓存查询（最快路径）
+	if val, ok := kv.lruCache.Get(args.Key); ok {
+		kv.stats.RecordCacheHit()
+		return kvraftapi.GetReply{
+			Value:   val,
+			Version: 1,
+			Err:     kvraftapi.OK,
+		}
+	}
+
+	// 存储查询
+	value, version, exists, err := kv.store.Get(args.Key)
+	if err != nil {
+		log.Printf("[KVServer-%d] Get error: %v", kv.me, err)
+		kv.stats.RecordFailure()
+		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	if exists {
+		kv.lruCache.Put(args.Key, value)
+		kv.stats.RecordCacheMiss()
+		return kvraftapi.GetReply{
+			Value:   value,
+			Version: kvraftapi.Tversion(version),
+			Err:     kvraftapi.OK,
+		}
+	}
+
+	kv.stats.RecordCacheMiss()
+	return kvraftapi.GetReply{Err: kvraftapi.ErrNoKey}
+}
+
+// doPut - 写操作：更新缓存和存储
+func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
+	if kv.killed() {
+		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	_, version, exists, err := kv.store.Get(args.Key)
+	if err != nil {
+		log.Printf("[KVServer-%d] Get error during Put: %v", kv.me, err)
+		kv.stats.RecordFailure()
+		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	if exists {
+		if kvraftapi.Tversion(version) == args.Version {
+			newVersion := version + 1
+			if err := kv.store.Put(args.Key, args.Value, newVersion); err != nil {
+				log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
+				kv.stats.RecordFailure()
+				return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+			}
+			kv.lruCache.Put(args.Key, args.Value)
+			kv.stats.RecordWrite()
+			return kvraftapi.PutReply{Err: kvraftapi.OK}
+		}
+		kv.stats.RecordFailure()
+		return kvraftapi.PutReply{Err: kvraftapi.ErrVersion}
+	}
+
+	if args.Version == 0 {
+		if err := kv.store.Put(args.Key, args.Value, 1); err != nil {
+			log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
+			kv.stats.RecordFailure()
+			return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+		}
+		kv.lruCache.Put(args.Key, args.Value)
+		kv.stats.RecordWrite()
+		return kvraftapi.PutReply{Err: kvraftapi.OK}
+	}
+
+	kv.stats.RecordFailure()
+	return kvraftapi.PutReply{Err: kvraftapi.ErrNoKey}
+}
+
+// ============================================================
+// 快照管理
+// ============================================================
+
+func (kv *KVServer) Snapshot() []byte {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	if kv.killed() {
+		return nil
+	}
+
+	data, err := kv.store.SaveSnapshot()
+	if err != nil {
+		log.Printf("[KVServer-%d] Snapshot error: %v", kv.me, err)
+		return nil
+	}
+	return data
+}
+
+func (kv *KVServer) Restore(data []byte) {
+	if len(data) == 0 {
+		if err := kv.store.Clear(); err != nil {
+			log.Printf("[KVServer-%d] Clear store error: %v", kv.me, err)
+		}
+		return
+	}
+
+	if err := kv.store.LoadSnapshot(data); err != nil {
+		log.Printf("[KVServer-%d] Restore snapshot error: %v", kv.me, err)
+	}
+}
+
+// ============================================================
+// RPC Handlers - 兼容旧 RPC 接口
+// ============================================================
+
+func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) error {
+	if kv.killed() {
+		reply.Err = kvraftapi.ErrWrongLeader
+		return nil
+	}
+	err, ret := kv.rsm.Submit(args)
+	if err != kvraftapi.OK {
+		reply.Err = err
+		return nil
+	}
+	getReply := ret.(kvraftapi.GetReply)
+	reply.Value = getReply.Value
+	reply.Version = getReply.Version
+	reply.Err = getReply.Err
+	kv.stats.RecordRead()
+	return nil
+}
+
+func (kv *KVServer) Put(args *kvraftapi.PutArgs, reply *kvraftapi.PutReply) error {
+	if kv.killed() {
+		reply.Err = kvraftapi.ErrWrongLeader
+		return nil
+	}
+	err, ret := kv.rsm.Submit(args)
+	if err != kvraftapi.OK {
+		reply.Err = err
+		return nil
+	}
+	putReply := ret.(kvraftapi.PutReply)
+	reply.Err = putReply.Err
+	kv.stats.RecordWrite()
+	return nil
+}
+
+// ============================================================
+// Watch 集成 - 关键的事件推送链路
+// ============================================================
+
+func (kv *KVServer) OnOpComplete(req any, result any, index int64) {
+	if kv.killed() {
+		return
+	}
+
+	watchMgr := kv.rsm.GetWatchManager()
+	if watchMgr == nil {
+		return
+	}
+
+	switch t := req.(type) {
+	case *kvraftapi.PutArgs:
+		kv.notifyPutEvent(t, result, watchMgr)
+	case kvraftapi.PutArgs:
+		kv.notifyPutEvent(&t, result, watchMgr)
+	}
+}
+
+func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watchMgr *watch.Manager) {
+	putReply, ok := result.(kvraftapi.PutReply)
+	if !ok {
+		return
+	}
+
+	if putReply.Err == kvraftapi.OK {
+		kv.mu.RLock()
+		oldValue, _, exists, _ := kv.store.Get(putArgs.Key)
+		kv.mu.RUnlock()
+
+		oldValueStr := ""
+		if exists {
+			oldValueStr = oldValue
+		}
+
+		eventType := "PUT"
+		if !exists {
+			eventType = "SET"
+		}
+
+		err := watchMgr.Notify(
+			putArgs.Key,
+			oldValueStr,
+			putArgs.Value,
+			int64(putArgs.Version),
+			eventType,
+		)
+
+		if err == nil {
+			kv.stats.RecordWatchNotify()
+		}
+	}
+}
+
+// ============================================================
+// 生命周期管理
+// ============================================================
+
+func (kv *KVServer) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+}
+
+func (kv *KVServer) killed() bool {
+	return atomic.LoadInt32(&kv.dead) == 1
+}
+
+// ============================================================
+// 统计方法
+// ============================================================
+
+func (s *ServerStats) RecordRead() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.TotalRequests++
+	s.TotalReads++
+}
+
+func (s *ServerStats) RecordWrite() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.TotalRequests++
+	s.TotalWrites++
+}
+
+func (s *ServerStats) RecordCacheHit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CacheHits++
+}
+
+func (s *ServerStats) RecordCacheMiss() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CacheMisses++
+}
+
+func (s *ServerStats) RecordFailure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FailedRequests++
+}
+
+func (s *ServerStats) RecordWatchNotify() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.WatchNotifies++
+}
+
+func (s *ServerStats) GetStats() (requests, writes, reads, failures, hits, misses int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TotalRequests, s.TotalWrites, s.TotalReads, s.FailedRequests, s.CacheHits, s.CacheMisses
+}
+
+// ============================================================
+// 服务器启动
+// ============================================================
+
+func StartKVServer(servers []string, gid int, me int, persister Persister, maxraftstate int, address string) *KVServer {
+	gob.Register(Op{})
+	gob.Register(kvraftapi.PutArgs{})
+	gob.Register(kvraftapi.GetArgs{})
+
+	store, err := storage.NewStore("badger-" + address)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	kv := &KVServer{
+		me:       me,
+		store:    store,
+		lruCache: cache.NewLRUCache(10000),
+		stats:    &ServerStats{},
+	}
+
+	kv.rsm = MakeRSM(servers, me, persister, maxraftstate, kv)
+	kv.rsm.RegisterOpCompleteListener(kv)
+
+	rpc.Register(kv)
+	rpcs := rpc.NewServer()
+	rpcs.Register(kv)
+	l, e := net.Listen("tcp", address)
+	if e != nil {
+		log.Fatal(e)
+	}
+
+	go func() {
+		for !kv.killed() {
+			conn, err := l.Accept()
+			if err == nil && !kv.killed() {
+				go rpcs.ServeConn(conn)
+			} else if err == nil {
+				conn.Close()
+			}
+		}
+		l.Close()
+	}()
+
+	return kv
+}

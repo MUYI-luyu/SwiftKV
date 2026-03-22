@@ -1,0 +1,276 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "kvraft/api/pb;pb";
+
+// ============================================================
+// RaftKV 高性能分布式键值存储服务定义
+// 支持：强一致性、Watch 推送、Read-Index 优化、流式接口
+// ============================================================
+
+service RaftKVService {
+  // === 基础写入操作 ===
+  rpc Put(PutRequest) returns (PutResponse);
+  
+  // === 基础读取操作 ===
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // === 删除操作 ===
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // === 条件更新（Compare-And-Swap）===
+  rpc CompareAndSwap(CASRequest) returns (CASResponse);
+  
+  // === 范围查询（前缀扫描）===
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  
+  // === Watch 机制：双向流订阅关键变化 ===
+  // 客户端可同时订阅多个 Key（支持前缀模式）
+  // 服务端在数据变化时异步推送
+  rpc Watch(stream WatchRequest) returns (stream WatchResponse);
+  
+  // === 只读优化路由（Leader 心跳确认后直接读）===
+  rpc GetWithReadIndex(GetRequest) returns (GetResponse);
+  
+  // === 集群管理接口 ===
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+  rpc GetLeaderInfo(GetLeaderInfoRequest) returns (GetLeaderInfoResponse);
+  
+  // === 元数据和统计 ===
+  rpc GetServerStats(GetServerStatsRequest) returns (GetServerStatsResponse);
+}
+
+// ============================================================
+// 基础数据类型
+// ============================================================
+
+// KeyValue 键值对
+message KeyValue {
+  string key = 1;
+  bytes value = 2;     // 使用 bytes 支持任意类型数据
+  int64 version = 3;   // 版本号，用于 CAS 和冲突检测
+  int64 timestamp = 4; // 操作时间戳（纳秒）
+  string create_by = 5; // 创建者（用于审计）
+}
+
+// ChangeEvent 键值变化事件（Watch 推送）
+message ChangeEvent {
+  string key = 1;
+  EventType type = 2;        // PUT、DELETE、SET
+  bytes old_value = 3;
+  bytes new_value = 4;
+  int64 old_version = 5;
+  int64 new_version = 6;
+  int64 timestamp = 7;       // 变化发生的时间戳
+  int64 revision = 8;        // 全局修订号（Raft 日志 Index）
+  string leader = 9;         // 当前 Leader
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  PUT = 1;
+  DELETE = 2;
+  SET = 3;
+}
+
+// ErrorInfo 错误信息
+message ErrorInfo {
+  string code = 1;
+  string message = 2;
+  int32 grpc_code = 3; // gRPC 错误码
+  bool retriable = 4;  // 是否可重试
+}
+
+// ============================================================
+// 请求/响应定义
+// ============================================================
+
+// === Get 操作 ===
+message GetRequest {
+  string key = 1;
+  int64 timeout_ms = 2; // 超时时间（毫秒），默认 1000
+  bool linearizable = 3; // 是否要求线性一致性（不需要走 Raft 日志）
+}
+
+message GetResponse {
+  bytes value = 1;
+  int64 version = 2;
+  int64 revision = 3;       // 当前 Raft 日志 Index
+  int64 timestamp = 4;
+  string leader = 5;
+  ErrorInfo error = 6;
+}
+
+// === Put 操作 ===
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  int64 expected_version = 3; // 如果不为 0，则只在版本匹配时更新（乐观锁）
+  int64 ttl_seconds = 4;      // TTL（秒）
+  bool sync = 5;              // 同步等待复制
+  int64 timeout_ms = 6;
+}
+
+message PutResponse {
+  int64 version = 1;
+  int64 revision = 2;
+  int64 timestamp = 3;
+  string leader = 4;
+  ErrorInfo error = 5;
+}
+
+// === Delete 操作 ===
+message DeleteRequest {
+  string key = 1;
+  int64 expected_version = 2;
+  int64 timeout_ms = 3;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+  int64 revision = 2;
+  int64 timestamp = 3;
+  string leader = 4;
+  ErrorInfo error = 5;
+}
+
+// === Compare-And-Swap （原子更新）===
+message CASRequest {
+  string key = 1;
+  int64 expected_version = 2;
+  bytes new_value = 3;
+  int64 timeout_ms = 4;
+}
+
+message CASResponse {
+  bool swapped = 1;
+  int64 new_version = 2;
+  int64 revision = 3;
+  int64 timestamp = 4;
+  string leader = 5;
+  ErrorInfo error = 6;
+}
+
+// === Scan 操作 ===
+message ScanRequest {
+  string key_prefix = 1;    // 前缀
+  int32 max_results = 2;    // 最大结果数（0 表示不限制）
+  bool reverse = 3;         // 反向遍历
+  string start_key = 4;     // 起始键（用于分页）
+  int64 timeout_ms = 5;
+}
+
+message ScanResponse {
+  repeated KeyValue items = 1;
+  bool has_more = 2;
+  string next_key = 3;
+  int64 revision = 4;
+  int64 timestamp = 5;
+  string leader = 6;
+  ErrorInfo error = 7;
+}
+
+// === Watch 操作（订阅）===
+message WatchRequest {
+  oneof request_union {
+    WatchCreateRequest create = 1;
+    WatchProgressRequest progress = 2;
+    WatchCancelRequest cancel = 3;
+  }
+}
+
+message WatchCreateRequest {
+  string key = 1;
+  bool is_prefix = 2;      // 是否为前缀订阅
+  int64 start_revision = 3; // 从哪个修订号开始订阅（用于重放历史）
+  int64 timeout_ms = 4;
+}
+
+message WatchProgressRequest {
+  int64 watcher_id = 1;    // 保活心跳
+}
+
+message WatchCancelRequest {
+  int64 watcher_id = 1;    // 取消订阅
+}
+
+message WatchResponse {
+  int64 watcher_id = 1;
+  repeated ChangeEvent events = 2;
+  int64 revision = 3;
+  int64 timestamp = 4;
+  string leader = 5;
+  bool created = 6;        // Watch 创建成功标志
+  ErrorInfo error = 7;
+}
+
+// ============================================================
+// 集群管理接口
+// ============================================================
+
+message GetClusterStatusRequest {}
+
+message GetClusterStatusResponse {
+  repeated NodeStatus nodes = 1;
+  string leader_id = 2;
+  int32 leader_term = 3;
+  int64 last_applied_index = 4;
+  int64 total_entries = 5;
+}
+
+message NodeStatus {
+  string id = 1;
+  string address = 2;      // gRPC 地址
+  bool is_leader = 3;
+  bool is_healthy = 4;
+  int64 last_heartbeat = 5;
+  int64 match_index = 6;   // Raft matchIndex
+  int64 next_index = 7;    // Raft nextIndex
+}
+
+// === Leader 信息 ===
+message GetLeaderInfoRequest {}
+
+message GetLeaderInfoResponse {
+  string leader_id = 1;
+  string leader_address = 2;
+  int32 current_term = 3;
+  int64 commit_index = 4;
+  string leader_status = 5; // healthy, degraded, etc.
+}
+
+// === 服务器统计信息 ===
+message GetServerStatsRequest {}
+
+message GetServerStatsResponse {
+  string server_id = 1;
+  string role = 2;           // Leader/Follower/Candidate
+  int32 current_term = 3;
+  int64 last_applied = 4;
+  int64 commit_index = 5;
+  int64 log_size = 6;
+  int64 snapshot_term = 7;
+  int64 snapshot_index = 8;
+  
+  // 性能指标
+  int64 total_requests = 9;
+  int64 total_write_ops = 10;
+  int64 total_read_ops = 11;
+  int64 failed_requests = 12;
+  
+  // 缓存统计
+  int64 cache_hits = 13;
+  int64 cache_misses = 14;
+  double cache_hit_rate = 15;
+  
+  // Watch 统计
+  int64 active_watchers = 16;
+  int64 total_watch_events = 17;
+  
+  // Raft 性能
+  int64 append_entries_count = 18;
+  int64 request_vote_count = 19;
+  int64 apply_latency_ms = 20; // 平均应用延迟
+  int64 commit_latency_ms = 21; // 平均提交延迟
+}

@@ -1,0 +1,78 @@
+# 操作系统相关
+.DS_Store
+.DS_Store?
+*.swp
+*.swo
+*~
+.vscode/
+
+# Go 构建产物
+/bin/
+/dist/
+*.exe
+*.so
+*.dylib
+*.a
+kvraft
+kvserver
+
+# Go 依赖与缓存
+vendor/
+go.sum.bak
+.go-version
+
+# IDE
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# 编译输出
+*.o
+*.out
+
+# BadgerDB 和测试数据文件（重要：此类文件不应上传）
+test-db-*/
+*-test-db/
+*.mem
+*.vlog
+*.sst
+MANIFEST*
+LOCK
+*.db
+
+# 性能分析文件
+*.pprof
+*.prof
+cpu.out
+mem.out
+
+# 测试覆盖率
+*.cover
+coverage.out
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+.tmp/
+
+# 日志文件
+*.log
+logs/
+
+# Docker 
+docker-volumes/
+.docker/
+
+# 生成的可执行文件（测试用）
+test-*
+*-test
+
+# Proto 编译中间文件
+*.pb.go.bak
+
+# 本地环境配置
+.env
+.env.local
+.env.*.local

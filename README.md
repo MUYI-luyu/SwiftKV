@@ -15,7 +15,7 @@
 - Go 1.25+
 - Git
 
-可选环境：
+待优化环境：
 - Docker / Docker Compose（用于容器化演示，当前仓库内 Docker 配置是模板，需补齐入口与配置目录后再用于生产）
 
 安装依赖：
@@ -27,7 +27,7 @@ go mod tidy
 ### 2. 获取代码
 
 ```bash
-git clone <your-repo-url>
+git clone git@github.com:jianger-yu/SwiftKV.git
 cd KVraft
 ```
 
