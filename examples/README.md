@@ -13,15 +13,6 @@ examples/
 └── README.md
 ```
 
-## 是否有文件冗余？
-
-结论：当前 examples 目录无明显冗余文件，建议全部保留。
-
-- server/main.go：用于本地多节点启动，是所有示例前提
-- basic/main.go：适合快速验证核心 API
-- scenarios/main.go：体现真实业务场景和并发操作
-- start_cluster.sh：降低启动成本，便于测试和演示
-
 ## 快速运行
 
 ### 1. 启动 3 节点
