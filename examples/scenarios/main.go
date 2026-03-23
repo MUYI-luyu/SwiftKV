@@ -199,7 +199,8 @@ func (cm *ConfigManager) SetConfig(key string, value string) error {
 // ===== 测试函数 =====
 
 func TestDistributedCounter() {
-	fmt.Println("=== 分布式计数器测试 ===\n")
+	fmt.Println("=== 分布式计数器测试 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -242,7 +243,8 @@ func TestDistributedCounter() {
 }
 
 func TestDistributedCache() {
-	fmt.Println("\n=== 分布式缓存测试 ===\n")
+	fmt.Println("\n=== 分布式缓存测试 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -288,7 +290,8 @@ func TestDistributedCache() {
 }
 
 func TestConfigManager() {
-	fmt.Println("\n=== 分布式配置管理测试 ===\n")
+	fmt.Println("\n=== 分布式配置管理测试 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -339,7 +342,8 @@ func main() {
 		fmt.Println("  bash examples/start_cluster.sh")
 		log.Fatal("启动失败")
 	}
-	fmt.Println("✅ 服务器连接成功!\n")
+	fmt.Println("✅ 服务器连接成功!")
+	fmt.Println()
 
 	TestDistributedCounter()
 	TestDistributedCache()

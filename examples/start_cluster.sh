@@ -31,6 +31,27 @@ echo "将启动 $SERVERS_COUNT 个服务器"
 echo "集群配置: $SERVERS"
 echo ""
 
+# 预清理：处理上次异常退出残留的进程和数据库目录锁
+for ((i=0; i<SERVERS_COUNT; i++)); do
+    PORT=$((BASE_PORT + i))
+
+    # 清理监听端口的旧进程（如果存在）
+    PIDS=$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $0}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)
+    if [ -n "$PIDS" ]; then
+        echo -e "${YELLOW}检测到端口 $PORT 已被占用，正在清理旧进程: $PIDS${NC}"
+        for pid in $PIDS; do
+            kill "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+
+    # 清理 Badger 本地目录，避免 LOCK 残留导致启动失败
+    DB_DIR="badger-127.0.0.1:$PORT"
+    if [ -d "$DB_DIR" ]; then
+        rm -rf "$DB_DIR"
+    fi
+done
+
 # 创建临时目录用于日志和 PID 文件
 WORK_DIR="/tmp/kvraft_$$"
 mkdir -p "$WORK_DIR"
@@ -92,8 +113,9 @@ for ((i=0; i<SERVERS_COUNT; i++)); do
 done
 echo ""
 
-echo "在另一个终端运行客户端测试:"
-echo -e "  ${YELLOW}cd $(pwd) && go run examples/client_test.go${NC}"
+echo "在另一个终端运行客户端示例:"
+echo -e "  ${YELLOW}cd $(pwd) && go run examples/basic/main.go${NC}"
+echo -e "  ${YELLOW}cd $(pwd) && go run examples/scenarios/main.go${NC}"
 echo ""
 echo "按 Ctrl+C 停止集群"
 echo ""

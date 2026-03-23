@@ -83,10 +83,20 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 
 	// 缓存查询（最快路径）
 	if val, ok := kv.lruCache.Get(args.Key); ok {
+		_, version, exists, err := kv.store.Get(args.Key)
+		if err != nil {
+			log.Printf("[KVServer-%d] Get version error: %v", kv.me, err)
+			kv.stats.RecordFailure()
+			return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+		}
+		if !exists {
+			kv.stats.RecordCacheMiss()
+			return kvraftapi.GetReply{Err: kvraftapi.ErrNoKey}
+		}
 		kv.stats.RecordCacheHit()
 		return kvraftapi.GetReply{
 			Value:   val,
-			Version: 1,
+			Version: kvraftapi.Tversion(version),
 			Err:     kvraftapi.OK,
 		}
 	}
@@ -371,6 +381,10 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	rpc.Register(kv)
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
+	// 注册 Raft RPC 服务，供节点间选举与日志复制调用。
+	if err := rpcs.RegisterName("Raft", kv.rsm.Raft()); err != nil {
+		log.Fatal(err)
+	}
 	l, e := net.Listen("tcp", address)
 	if e != nil {
 		log.Fatal(e)

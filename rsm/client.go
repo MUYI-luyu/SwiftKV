@@ -2,29 +2,91 @@ package rsm
 
 import (
 	"fmt"
+	"net"
 	"net/rpc"
 	"time"
 
 	kvraftapi "kvraft/raftkv/rpc"
+	"kvraft/sharding"
 )
 
 type Clerk struct {
-	servers []string
-	leader  int // 记录最近成功的leader
+	servers     []string
+	leader      int // 记录最近成功的leader
+	hasher      *sharding.ConsistentHash
+	serverToIdx map[string]int
 }
 
 func MakeClerk(servers []string) *Clerk {
-	return &Clerk{
-		servers: servers,
-		leader:  0,
+	ck := &Clerk{
+		servers:     servers,
+		leader:      0,
+		hasher:      sharding.NewConsistentHash(32),
+		serverToIdx: make(map[string]int, len(servers)),
 	}
+	for i, s := range servers {
+		ck.serverToIdx[s] = i
+		ck.hasher.AddNode(s)
+	}
+	return ck
+}
+
+func (ck *Clerk) preferredIndex(key string) int {
+	if len(ck.servers) == 0 || ck.hasher == nil {
+		return 0
+	}
+	node := ck.hasher.GetNode(key)
+	if idx, ok := ck.serverToIdx[node]; ok {
+		return idx
+	}
+	return ck.leader
+}
+
+func (ck *Clerk) preferredCandidates(key string) []int {
+	if len(ck.servers) == 0 || ck.hasher == nil {
+		return []int{0}
+	}
+
+	count := 3
+	if len(ck.servers) < count {
+		count = len(ck.servers)
+	}
+
+	nodes := ck.hasher.GetNodes(key, count)
+	seen := make(map[int]bool, len(ck.servers))
+	idxs := make([]int, 0, len(ck.servers))
+
+	for _, n := range nodes {
+		if idx, ok := ck.serverToIdx[n]; ok && !seen[idx] {
+			idxs = append(idxs, idx)
+			seen[idx] = true
+		}
+	}
+
+	if !seen[ck.leader] && ck.leader >= 0 && ck.leader < len(ck.servers) {
+		idxs = append(idxs, ck.leader)
+		seen[ck.leader] = true
+	}
+
+	for i := range ck.servers {
+		if !seen[i] {
+			idxs = append(idxs, i)
+		}
+	}
+
+	if len(idxs) == 0 {
+		return []int{0}
+	}
+	return idxs
 }
 
 func call(server string, rpcname string, args interface{}, reply interface{}) bool {
-	client, err := rpc.Dial("tcp", server)
+	conn, err := net.DialTimeout("tcp", server, 600*time.Millisecond)
 	if err != nil {
 		return false
 	}
+	_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+	client := rpc.NewClient(conn)
 	defer client.Close()
 
 	err = client.Call(rpcname, args, reply)
@@ -41,7 +103,6 @@ func call(server string, rpcname string, args interface{}, reply interface{}) bo
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 	args := kvraftapi.GetArgs{Key: key}
-	index := ck.leader
 	timeout := time.After(10 * time.Second)
 	attempts := 0
 
@@ -55,28 +116,29 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 		default:
 		}
 
-		reply := kvraftapi.GetReply{}
-		ok := call(ck.servers[index], "KVServer.Get", &args, &reply)
+		candidates := ck.preferredCandidates(key)
+		for _, index := range candidates {
+			reply := kvraftapi.GetReply{}
+			ok := call(ck.servers[index], "KVServer.Get", &args, &reply)
 
-		if ok {
-			ck.leader = index
-			switch reply.Err {
-			case kvraftapi.OK:
-				return reply.Value, reply.Version, reply.Err
-			case kvraftapi.ErrNoKey:
-				return "", 0, reply.Err
+			if ok {
+				ck.leader = index
+				switch reply.Err {
+				case kvraftapi.OK:
+					return reply.Value, reply.Version, reply.Err
+				case kvraftapi.ErrNoKey:
+					return "", 0, reply.Err
+				}
+			}
+
+			attempts++
+			if attempts > 100 {
+				fmt.Printf("\n⚠️  Get 已尝试 %d 次，仍无可用服务器\n", attempts)
+				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
+				fmt.Println("  bash examples/start_cluster.sh")
+				return "", 0, kvraftapi.ErrWrongLeader
 			}
 		}
-
-		attempts++
-		if attempts > 100 {
-			fmt.Printf("\n⚠️  Get 已尝试 %d 次，仍无可用服务器\n", attempts)
-			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-			fmt.Println("  bash examples/start_cluster.sh")
-			return "", 0, kvraftapi.ErrWrongLeader
-		}
-
-		index = (index + 1) % len(ck.servers)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -95,7 +157,6 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraftapi.Err {
 	args := kvraftapi.PutArgs{Key: key, Value: value, Version: version}
-	index := ck.leader
 	retry := false
 	timeout := time.After(10 * time.Second)
 	attempts := 0
@@ -110,33 +171,35 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 		default:
 		}
 
-		reply := kvraftapi.PutReply{}
-		ok := call(ck.servers[index], "KVServer.Put", &args, &reply)
-		if ok {
-			switch reply.Err {
-			case kvraftapi.OK, kvraftapi.ErrNoKey:
-				ck.leader = index
-				return reply.Err
-			case kvraftapi.ErrVersion:
-				ck.leader = index
-				if !retry {
-					return kvraftapi.ErrVersion
+		candidates := ck.preferredCandidates(key)
+		for _, index := range candidates {
+			reply := kvraftapi.PutReply{}
+			ok := call(ck.servers[index], "KVServer.Put", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case kvraftapi.OK, kvraftapi.ErrNoKey:
+					ck.leader = index
+					return reply.Err
+				case kvraftapi.ErrVersion:
+					ck.leader = index
+					if !retry {
+						return kvraftapi.ErrVersion
+					}
+					return kvraftapi.ErrMaybe
+				default: // kvraftapi.ErrWrongLeader
 				}
-				return kvraftapi.ErrMaybe
-			default: // kvraftapi.ErrWrongLeader
+			}
+
+			attempts++
+			if attempts > 100 {
+				fmt.Printf("\n⚠️  Put 已尝试 %d 次，仍无可用服务器\n", attempts)
+				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
+				fmt.Println("  bash examples/start_cluster.sh")
+				return kvraftapi.ErrWrongLeader
 			}
 		}
 
-		attempts++
-		if attempts > 100 {
-			fmt.Printf("\n⚠️  Put 已尝试 %d 次，仍无可用服务器\n", attempts)
-			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-			fmt.Println("  bash examples/start_cluster.sh")
-			return kvraftapi.ErrWrongLeader
-		}
-
 		retry = true
-		index = (index + 1) % len(ck.servers)
 		time.Sleep(100 * time.Millisecond)
 	}
 }

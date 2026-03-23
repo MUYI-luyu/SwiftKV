@@ -28,7 +28,8 @@ func checkServerAvailable(servers []string, timeout time.Duration) bool {
 
 // SimpleExample 展示最基础的使用场景
 func SimpleExample() {
-	fmt.Println("=== 简单示例 ===\n")
+	fmt.Println("=== 简单示例 ===")
+	fmt.Println()
 
 	// 1. 创建客户端，连接到服务器集群
 	servers := []string{
@@ -77,7 +78,8 @@ func SimpleExample() {
 
 // ConcurrencyExample 展示并发访问
 func ConcurrencyExample() {
-	fmt.Println("\n=== 并发访问示例 ===\n")
+	fmt.Println("\n=== 并发访问示例 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -126,7 +128,8 @@ func ConcurrencyExample() {
 
 // ErrorHandlingExample 展示错误处理
 func ErrorHandlingExample() {
-	fmt.Println("\n=== 错误处理示例 ===\n")
+	fmt.Println("\n=== 错误处理示例 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -181,7 +184,8 @@ func ErrorHandlingExample() {
 
 // PersistenceExample 展示数据持久性
 func PersistenceExample() {
-	fmt.Println("\n=== 数据持久性示例 ===\n")
+	fmt.Println("\n=== 数据持久性示例 ===")
+	fmt.Println()
 
 	servers := []string{
 		"127.0.0.1:5001",
@@ -248,7 +252,8 @@ func main() {
 		fmt.Println("  go run examples/server.go -me 2 -servers 127.0.0.1:5001,127.0.0.1:5002,127.0.0.1:5003 -port 5003")
 		log.Fatal("启动失败")
 	}
-	fmt.Println("✅ 服务器连接成功!\n")
+	fmt.Println("✅ 服务器连接成功!")
+	fmt.Println()
 
 	SimpleExample()
 	ConcurrencyExample()

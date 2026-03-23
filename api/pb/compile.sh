@@ -30,14 +30,14 @@ if ! go list -m google.golang.org/grpc &>/dev/null; then
 fi
 
 # 编译 Proto 文件
-echo "📝 编译 raftkv.proto..."
+echo "📝 编译 kvraft.proto..."
 protoc \
     --go_out="${OUTPUT_DIR}" \
     --go_opt=paths=source_relative \
     --go-grpc_out="${OUTPUT_DIR}" \
     --go-grpc_opt=paths=source_relative \
     -I"${PROTO_DIR}" \
-    "${PROTO_DIR}/raftkv.proto"
+    "${PROTO_DIR}/kvraft.proto"
 
 echo "✅ Proto 编译完成！"
 echo "📍 生成文件："
