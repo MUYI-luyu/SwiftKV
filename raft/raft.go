@@ -72,6 +72,7 @@ type Raft struct {
 	lastIncludedTerm  int
 
 	// RPC 客户端连接缓存
+	rpcMu      sync.Mutex
 	rpcClients map[string]*rpc.Client
 }
 
@@ -87,14 +88,39 @@ func (rf *Raft) callPeer(server int, method string, args interface{}, reply inte
 
 	address := rf.peers[server]
 
-	client, err := rpc.Dial("tcp", address)
-	if err != nil {
-		return false
-	}
-	defer client.Close()
+	rf.rpcMu.Lock()
+	client := rf.rpcClients[address]
+	rf.rpcMu.Unlock()
 
-	err = client.Call(method, args, reply)
-	return err == nil
+	if client == nil {
+		newClient, err := rpc.Dial("tcp", address)
+		if err != nil {
+			return false
+		}
+		rf.rpcMu.Lock()
+		if existing := rf.rpcClients[address]; existing != nil {
+			_ = newClient.Close()
+			client = existing
+		} else {
+			rf.rpcClients[address] = newClient
+			client = newClient
+		}
+		rf.rpcMu.Unlock()
+	}
+
+	err := client.Call(method, args, reply)
+	if err == nil {
+		return true
+	}
+
+	// 连接失效时清理缓存，后续自动重建。
+	rf.rpcMu.Lock()
+	if cur := rf.rpcClients[address]; cur == client {
+		delete(rf.rpcClients, address)
+		_ = client.Close()
+	}
+	rf.rpcMu.Unlock()
+	return false
 }
 
 // 返回当前任期以及该服务器是否认为自己是领导者。
@@ -963,7 +989,7 @@ func (rf *Raft) applier() {
 			rf.applyCh <- msg
 		}
 
-		time.Sleep(10 * time.Millisecond) // 更频繁的应用
+		time.Sleep(1 * time.Millisecond) // 降低提交到状态机的额外等待
 	}
 }
 
@@ -996,6 +1022,7 @@ func Make(peers []string, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.applyCh = applyCh
+	rf.rpcClients = make(map[string]*rpc.Client, len(peers))
 
 	// 你的初始化代码在这里 (3A, 3B, 3C)。
 

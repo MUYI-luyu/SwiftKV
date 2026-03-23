@@ -87,17 +87,7 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	}
 
 	// 缓存查询（最快路径）
-	if val, ok := kv.lruCache.Get(args.Key); ok {
-		_, version, exists, err := kv.store.Get(args.Key)
-		if err != nil {
-			log.Printf("[KVServer-%d] Get version error: %v", kv.me, err)
-			kv.stats.RecordFailure()
-			return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
-		}
-		if !exists {
-			kv.stats.RecordCacheMiss()
-			return kvraftapi.GetReply{Err: kvraftapi.ErrNoKey}
-		}
+	if val, version, ok := kv.lruCache.GetWithVersion(args.Key); ok {
 		kv.stats.RecordCacheHit()
 		return kvraftapi.GetReply{
 			Value:   val,
@@ -115,7 +105,7 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	}
 
 	if exists {
-		kv.lruCache.Put(args.Key, value)
+		kv.lruCache.PutWithVersion(args.Key, value, version)
 		kv.stats.RecordCacheMiss()
 		return kvraftapi.GetReply{
 			Value:   value,
@@ -149,7 +139,7 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 				kv.stats.RecordFailure()
 				return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 			}
-			kv.lruCache.Put(args.Key, args.Value)
+			kv.lruCache.PutWithVersion(args.Key, args.Value, newVersion)
 			kv.stats.RecordWrite()
 			return kvraftapi.PutReply{Err: kvraftapi.OK}
 		}
@@ -163,7 +153,7 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 			kv.stats.RecordFailure()
 			return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 		}
-		kv.lruCache.Put(args.Key, args.Value)
+		kv.lruCache.PutWithVersion(args.Key, args.Value, 1)
 		kv.stats.RecordWrite()
 		return kvraftapi.PutReply{Err: kvraftapi.OK}
 	}
@@ -218,6 +208,8 @@ func (kv *KVServer) Snapshot() []byte {
 }
 
 func (kv *KVServer) Restore(data []byte) {
+	kv.lruCache.Clear()
+
 	if len(data) == 0 {
 		if err := kv.store.Clear(); err != nil {
 			log.Printf("[KVServer-%d] Clear store error: %v", kv.me, err)

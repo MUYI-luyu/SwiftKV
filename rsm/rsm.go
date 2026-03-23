@@ -189,7 +189,9 @@ func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
 
 	err, result := func() (kvraftapi.Err, any) {
 		timer := time.NewTimer(1500 * time.Millisecond)
+		leaderCheck := time.NewTicker(50 * time.Millisecond)
 		defer timer.Stop()
+		defer leaderCheck.Stop()
 		for {
 			if rsm.shutdown.Load() {
 				return kvraftapi.ErrWrongLeader, nil
@@ -198,7 +200,7 @@ func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
 			case <-timer.C:
 				// 超时，返回错误
 				return kvraftapi.ErrWrongLeader, nil
-			case <-time.After(300 * time.Millisecond):
+			case <-leaderCheck.C:
 				currentTerm, stillLeader := rsm.rf.GetState()
 				if !stillLeader || currentTerm != term {
 					// 领导者已经变更

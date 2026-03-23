@@ -16,8 +16,10 @@ type LRUCache struct {
 
 // Entry 缓存条目
 type Entry struct {
-	key   string
-	value string
+	key        string
+	value      string
+	version    uint64
+	hasVersion bool
 }
 
 // CacheStats 缓存统计
@@ -53,18 +55,65 @@ func (lru *LRUCache) Get(key string) (string, bool) {
 	return elem.Value.(*Entry).value, true
 }
 
+// GetWithVersion 获取缓存值与版本号。
+// 如果该条目未携带版本号，返回 version=0 且 ok=true。
+func (lru *LRUCache) GetWithVersion(key string) (string, uint64, bool) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	elem, exists := lru.cache[key]
+	if !exists {
+		lru.stats.Misses++
+		return "", 0, false
+	}
+
+	lru.list.MoveToFront(elem)
+	lru.stats.Hits++
+	ent := elem.Value.(*Entry)
+	return ent.value, ent.version, true
+}
+
 // Put 设置缓存值
 func (lru *LRUCache) Put(key, value string) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
 	if elem, exists := lru.cache[key]; exists {
-		elem.Value.(*Entry).value = value
+		ent := elem.Value.(*Entry)
+		ent.value = value
+		ent.version = 0
+		ent.hasVersion = false
 		lru.list.MoveToFront(elem)
 		return
 	}
 
-	entry := &Entry{key: key, value: value}
+	entry := &Entry{key: key, value: value, version: 0, hasVersion: false}
+	elem := lru.list.PushFront(entry)
+	lru.cache[key] = elem
+
+	if lru.list.Len() > lru.capacity {
+		oldest := lru.list.Back()
+		lru.list.Remove(oldest)
+		delete(lru.cache, oldest.Value.(*Entry).key)
+		lru.stats.Evictions++
+	}
+}
+
+// PutWithVersion 设置缓存值并携带版本号。
+func (lru *LRUCache) PutWithVersion(key, value string, version uint64) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	if elem, exists := lru.cache[key]; exists {
+		ent := elem.Value.(*Entry)
+		ent.value = value
+		ent.version = version
+		ent.hasVersion = true
+		lru.list.MoveToFront(elem)
+		return
+	}
+
+	entry := &Entry{key: key, value: value, version: version, hasVersion: true}
 	elem := lru.list.PushFront(entry)
 	lru.cache[key] = elem
 

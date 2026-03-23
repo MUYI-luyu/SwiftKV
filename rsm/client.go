@@ -144,9 +144,19 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 		}
 	}
 
-	if !seen[ck.leader] && ck.leader >= 0 && ck.leader < len(ck.grpcServers) {
-		idxs = append(idxs, ck.leader)
-		seen[ck.leader] = true
+	// 单 Raft 组场景下，优先走最近成功 leader，可显著减少 WrongLeader 往返。
+	if ck.leader >= 0 && ck.leader < len(ck.grpcServers) {
+		if !seen[ck.leader] {
+			idxs = append([]int{ck.leader}, idxs...)
+			seen[ck.leader] = true
+		} else {
+			for i, v := range idxs {
+				if v == ck.leader {
+					idxs = append([]int{v}, append(idxs[:i], idxs[i+1:]...)...)
+					break
+				}
+			}
+		}
 	}
 
 	for i := range ck.grpcServers {
@@ -260,7 +270,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 				return "", 0, kvraftapi.ErrWrongLeader
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -343,7 +353,7 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 		}
 
 		retry = true
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -383,7 +393,7 @@ func (ck *Clerk) Delete(key string) kvraftapi.Err {
 			}
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
