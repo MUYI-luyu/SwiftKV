@@ -31,3 +31,11 @@ type PutArgs struct {
 type PutReply struct {
 	Err Err
 }
+
+type DeleteArgs struct {
+	Key string
+}
+
+type DeleteReply struct {
+	Err Err
+}

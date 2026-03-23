@@ -1,42 +1,111 @@
 syntax = "proto3";
 
-package api.pb;
+package pb;
 
-option go_package = "kvraft/api/pb";
+option go_package = "kvraft/api/pb/kvraft/api/pb;pb";
 
-// KVraft 服务定义（当前实现的稳定子集）
-service KVraft {
-    rpc Get(GetRequest) returns (GetResponse) {}
-    rpc Put(PutRequest) returns (PutResponse) {}
+// KV存储服务
+service KVService {
+  // 基础操作
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // 范围查询（简单版）
+  rpc Scan(ScanRequest) returns (ScanResponse);
+
+  // Watch - 订阅键值变化（双向流）
+  rpc Watch(stream WatchRequest) returns (stream WatchEvent);
+
+  // 集群状态
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
 }
 
-// ============================================================
-// Get 操作
-// ============================================================
+// ============ 基础操作 ============
 message GetRequest {
-    string key = 1;
+  string key = 1;
 }
 
 message GetResponse {
-    string value = 1;
-    int64 version = 2;
-    string error = 3;
-    int64 raft_index = 4;
+  string value = 1;
+  int64 version = 2;
+  string error = 3;
 }
 
-// ============================================================
-// Put 操作
-// ============================================================
 message PutRequest {
-    string key = 1;
-    string value = 2;
-    int64 version = 3;  // CAS 版本号：0 表示新建，>0 表示更新
+  string key = 1;
+  string value = 2;
+  int64 version = 3;
 }
 
 message PutResponse {
-    bool success = 1;
-    int64 new_version = 2;  // 成功时返回新版本号
-    string error = 3;
-    int64 raft_index = 4;
+  string error = 1;
 }
 
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  string error = 1;
+}
+
+// ============ 范围查询 ============
+message ScanRequest {
+  string prefix = 1;
+  int32 limit = 2;
+}
+
+message ScanResponse {
+  repeated KeyValue items = 1;
+  string error = 2;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+  int64 version = 3;
+}
+
+// ============ Watch ============
+message WatchCreateRequest {
+  string key = 1;
+  bool prefix = 2;
+}
+
+message WatchCancelRequest {
+  int64 watch_id = 1;
+}
+
+message WatchRequest {
+  oneof request_type {
+    WatchCreateRequest create = 1;
+    WatchCancelRequest cancel = 2;
+  }
+}
+
+message WatchEvent {
+  int64 watch_id = 1;
+  string key = 2;
+  string old_value = 3;
+  string new_value = 4;
+  int64 new_version = 5;
+  string event_type = 6;
+}
+
+// ============ 集群状态 ============
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  string leader_id = 1;
+  repeated NodeStatus nodes = 2;
+  int64 current_term = 3;
+  int64 last_applied = 4;
+}
+
+message NodeStatus {
+  int32 id = 1;
+  string address = 2;
+  bool is_leader = 3;
+  bool is_alive = 4;
+}

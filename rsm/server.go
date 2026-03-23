@@ -34,6 +34,7 @@ type OperationInfo struct {
 type KVServer struct {
 	me       int
 	dead     int32
+	address  string
 	rsm      *RSM
 	mu       sync.RWMutex
 	store    *storage.Store
@@ -69,6 +70,10 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.doPut(t)
 	case kvraftapi.PutArgs:
 		return kv.doPut(&t)
+	case *kvraftapi.DeleteArgs:
+		return kv.doDelete(t)
+	case kvraftapi.DeleteArgs:
+		return kv.doDelete(&t)
 	default:
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, t)
 		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
@@ -167,6 +172,32 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 	return kvraftapi.PutReply{Err: kvraftapi.ErrNoKey}
 }
 
+func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
+	if kv.killed() {
+		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	_, _, exists, err := kv.store.Get(args.Key)
+	if err != nil {
+		log.Printf("[KVServer-%d] Get error during Delete: %v", kv.me, err)
+		kv.stats.RecordFailure()
+		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+	}
+	if !exists {
+		return kvraftapi.DeleteReply{Err: kvraftapi.ErrNoKey}
+	}
+
+	if err := kv.store.Delete(args.Key); err != nil {
+		log.Printf("[KVServer-%d] Delete error: %v", kv.me, err)
+		kv.stats.RecordFailure()
+		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	kv.lruCache.Delete(args.Key)
+	kv.stats.RecordWrite()
+	return kvraftapi.DeleteReply{Err: kvraftapi.OK}
+}
+
 // ============================================================
 // 快照管理
 // ============================================================
@@ -234,6 +265,21 @@ func (kv *KVServer) Put(args *kvraftapi.PutArgs, reply *kvraftapi.PutReply) erro
 	putReply := ret.(kvraftapi.PutReply)
 	reply.Err = putReply.Err
 	kv.stats.RecordWrite()
+	return nil
+}
+
+func (kv *KVServer) Delete(args *kvraftapi.DeleteArgs, reply *kvraftapi.DeleteReply) error {
+	if kv.killed() {
+		reply.Err = kvraftapi.ErrWrongLeader
+		return nil
+	}
+	err, ret := kv.rsm.Submit(args)
+	if err != kvraftapi.OK {
+		reply.Err = err
+		return nil
+	}
+	deleteReply := ret.(kvraftapi.DeleteReply)
+	reply.Err = deleteReply.Err
 	return nil
 }
 
@@ -362,6 +408,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	gob.Register(Op{})
 	gob.Register(kvraftapi.PutArgs{})
 	gob.Register(kvraftapi.GetArgs{})
+	gob.Register(kvraftapi.DeleteArgs{})
 
 	store, err := storage.NewStore("badger-" + address)
 	if err != nil {
@@ -370,6 +417,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 
 	kv := &KVServer{
 		me:       me,
+		address:  address,
 		store:    store,
 		lruCache: cache.NewLRUCache(10000),
 		stats:    &ServerStats{},
@@ -401,6 +449,9 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 		}
 		l.Close()
 	}()
+
+	// 对外业务接口迁移到 gRPC（Raft 复制仍使用 RPC）。
+	startGRPCServer(kv, address)
 
 	return kv
 }

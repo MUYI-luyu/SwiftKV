@@ -11,6 +11,12 @@ import (
 	"kvraft/rsm"
 )
 
+var scenarioKeyPrefix = fmt.Sprintf("scenario:%d:", time.Now().UnixNano())
+
+func scenarioKey(name string) string {
+	return scenarioKeyPrefix + name
+}
+
 // checkServerAvailableForRealWorld 检查服务器是否可用（避免无限循环）
 func checkServerAvailableForRealWorld(servers []string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
@@ -37,7 +43,7 @@ type DistributedCounter struct {
 func NewDistributedCounter(servers []string, key string) *DistributedCounter {
 	return &DistributedCounter{
 		clerk: rsm.MakeClerk(servers),
-		key:   key,
+		key:   scenarioKey(key),
 	}
 }
 
@@ -219,7 +225,7 @@ func TestDistributedCounter() {
 
 	fmt.Println("\n并发递增测试:")
 	counter2 := NewDistributedCounter(servers, "concurrent_counter")
-	counter2.clerk.Put("concurrent_counter", "0", 0)
+	counter2.clerk.Put(counter2.key, "0", 0)
 
 	var wg sync.WaitGroup
 	numGoroutines := 5
@@ -256,18 +262,20 @@ func TestDistributedCache() {
 
 	// 基本操作
 	fmt.Println("基本缓存操作:")
-	cache.Set("name", "Alice", 0)
-	if val, ok := cache.Get("name"); ok {
-		fmt.Printf("  cache.Get('name') => '%s'\n", val)
+	nameKey := scenarioKey("name")
+	cache.Set(nameKey, "Alice", 0)
+	if val, ok := cache.Get(nameKey); ok {
+		fmt.Printf("  cache.Get('%s') => '%s'\n", nameKey, val)
 	}
 
 	// 缓存递增
 	fmt.Println("\n缓存计数器:")
-	cache.Increment("page_views", 1)
-	val, _ := cache.Increment("page_views", 1)
+	pageViewsKey := scenarioKey("page_views")
+	cache.Increment(pageViewsKey, 1)
+	val, _ := cache.Increment(pageViewsKey, 1)
 	fmt.Printf("  第一次访问后: page_views = %d\n", val)
 
-	val, _ = cache.Increment("page_views", 5)
+	val, _ = cache.Increment(pageViewsKey, 5)
 	fmt.Printf("  第二次访问后: page_views = %d\n", val)
 
 	// 并发缓存操作
@@ -277,13 +285,13 @@ func TestDistributedCache() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			cache.Set(fmt.Sprintf("user_%d", id), fmt.Sprintf("User%d", id), 0)
+			cache.Set(scenarioKey(fmt.Sprintf("user_%d", id)), fmt.Sprintf("User%d", id), 0)
 		}(i)
 	}
 	wg.Wait()
 
 	for i := 0; i < 3; i++ {
-		if val, ok := cache.Get(fmt.Sprintf("user_%d", i)); ok {
+		if val, ok := cache.Get(scenarioKey(fmt.Sprintf("user_%d", i))); ok {
 			fmt.Printf("  user_%d = %s\n", i, val)
 		}
 	}
@@ -302,20 +310,24 @@ func TestConfigManager() {
 	config := NewConfigManager(servers)
 
 	fmt.Println("设置和读取配置:")
-	config.SetConfig("database_url", "postgresql://localhost/mydb")
-	config.SetConfig("api_key", "secret123")
-	config.SetConfig("debug_mode", "true")
+	databaseURLKey := scenarioKey("database_url")
+	apiKeyKey := scenarioKey("api_key")
+	debugModeKey := scenarioKey("debug_mode")
 
-	fmt.Printf("  database_url = %s\n", config.GetConfig("database_url"))
-	fmt.Printf("  api_key = %s\n", config.GetConfig("api_key"))
-	fmt.Printf("  debug_mode = %s\n", config.GetConfig("debug_mode"))
+	config.SetConfig(databaseURLKey, "postgresql://localhost/mydb")
+	config.SetConfig(apiKeyKey, "secret123")
+	config.SetConfig(debugModeKey, "true")
+
+	fmt.Printf("  database_url = %s\n", config.GetConfig(databaseURLKey))
+	fmt.Printf("  api_key = %s\n", config.GetConfig(apiKeyKey))
+	fmt.Printf("  debug_mode = %s\n", config.GetConfig(debugModeKey))
 
 	fmt.Println("\n缓存验证（第二次读取应该从缓存获取）:")
-	fmt.Printf("  database_url = %s\n", config.GetConfig("database_url"))
+	fmt.Printf("  database_url = %s\n", config.GetConfig(databaseURLKey))
 
 	fmt.Println("\n配置更新:")
-	config.SetConfig("database_url", "postgresql://newhost/mydb")
-	fmt.Printf("  更新后 database_url = %s\n", config.GetConfig("database_url"))
+	config.SetConfig(databaseURLKey, "postgresql://newhost/mydb")
+	fmt.Printf("  更新后 database_url = %s\n", config.GetConfig(databaseURLKey))
 }
 
 func main() {

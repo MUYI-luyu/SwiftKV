@@ -1,38 +1,119 @@
 package rsm
 
 import (
+	"context"
 	"fmt"
-	"net"
-	"net/rpc"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	pb "kvraft/api/pb/kvraft/api/pb"
 	kvraftapi "kvraft/raftkv/rpc"
 	"kvraft/sharding"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 type Clerk struct {
 	servers     []string
-	leader      int // 记录最近成功的leader
+	grpcServers []string
+	leader      int // 最近成功 leader 在 grpcServers 中的索引
 	hasher      *sharding.ConsistentHash
 	serverToIdx map[string]int
+
+	mu      sync.Mutex
+	conns   map[string]*grpc.ClientConn
+	clients map[string]pb.KVServiceClient
 }
 
 func MakeClerk(servers []string) *Clerk {
+	grpcServers := make([]string, 0, len(servers))
+	for _, s := range servers {
+		grpcServers = append(grpcServers, toGRPCAddress(s))
+	}
+
 	ck := &Clerk{
 		servers:     servers,
+		grpcServers: grpcServers,
 		leader:      0,
 		hasher:      sharding.NewConsistentHash(32),
-		serverToIdx: make(map[string]int, len(servers)),
+		serverToIdx: make(map[string]int, len(grpcServers)),
+		conns:       make(map[string]*grpc.ClientConn, len(grpcServers)),
+		clients:     make(map[string]pb.KVServiceClient, len(grpcServers)),
 	}
-	for i, s := range servers {
+	for i, s := range grpcServers {
 		ck.serverToIdx[s] = i
 		ck.hasher.AddNode(s)
+	}
+	// 预热连接池，减少首包延迟。
+	for _, s := range grpcServers {
+		_, _ = ck.getClient(s)
 	}
 	return ck
 }
 
+func toGRPCAddress(raftAddr string) string {
+	parts := strings.Split(raftAddr, ":")
+	if len(parts) != 2 {
+		return raftAddr
+	}
+	p, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return raftAddr
+	}
+	return fmt.Sprintf("%s:%d", parts[0], p+1000)
+}
+
+func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	if c, ok := ck.clients[addr]; ok {
+		if conn := ck.conns[addr]; conn != nil && conn.GetState() == connectivity.Shutdown {
+			delete(ck.clients, addr)
+			delete(ck.conns, addr)
+		} else {
+			return c, nil
+		}
+	}
+
+	target := "passthrough:///" + addr
+	conn, err := grpc.NewClient(
+		target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// 显式触发连接建立并等待 Ready（受超时控制）。
+	conn.Connect()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for conn.GetState() != connectivity.Ready {
+		if !conn.WaitForStateChange(ctx, conn.GetState()) {
+			break
+		}
+	}
+
+	client := pb.NewKVServiceClient(conn)
+	ck.conns[addr] = conn
+	ck.clients[addr] = client
+	return client, nil
+}
+
 func (ck *Clerk) preferredIndex(key string) int {
-	if len(ck.servers) == 0 || ck.hasher == nil {
+	if len(ck.grpcServers) == 0 || ck.hasher == nil {
 		return 0
 	}
 	node := ck.hasher.GetNode(key)
@@ -43,18 +124,18 @@ func (ck *Clerk) preferredIndex(key string) int {
 }
 
 func (ck *Clerk) preferredCandidates(key string) []int {
-	if len(ck.servers) == 0 || ck.hasher == nil {
+	if len(ck.grpcServers) == 0 || ck.hasher == nil {
 		return []int{0}
 	}
 
 	count := 3
-	if len(ck.servers) < count {
-		count = len(ck.servers)
+	if len(ck.grpcServers) < count {
+		count = len(ck.grpcServers)
 	}
 
 	nodes := ck.hasher.GetNodes(key, count)
-	seen := make(map[int]bool, len(ck.servers))
-	idxs := make([]int, 0, len(ck.servers))
+	seen := make(map[int]bool, len(ck.grpcServers))
+	idxs := make([]int, 0, len(ck.grpcServers))
 
 	for _, n := range nodes {
 		if idx, ok := ck.serverToIdx[n]; ok && !seen[idx] {
@@ -63,12 +144,12 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 		}
 	}
 
-	if !seen[ck.leader] && ck.leader >= 0 && ck.leader < len(ck.servers) {
+	if !seen[ck.leader] && ck.leader >= 0 && ck.leader < len(ck.grpcServers) {
 		idxs = append(idxs, ck.leader)
 		seen[ck.leader] = true
 	}
 
-	for i := range ck.servers {
+	for i := range ck.grpcServers {
 		if !seen[i] {
 			idxs = append(idxs, i)
 		}
@@ -80,24 +161,40 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 	return idxs
 }
 
-func call(server string, rpcname string, args interface{}, reply interface{}) bool {
-	conn, err := net.DialTimeout("tcp", server, 600*time.Millisecond)
-	if err != nil {
-		return false
+func parseRedirectLeaderAddr(msg string) string {
+	re := regexp.MustCompile(`([a-zA-Z0-9._-]+:\d{2,5})`)
+	m := re.FindStringSubmatch(msg)
+	if len(m) == 0 {
+		return ""
 	}
-	_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
-	client := rpc.NewClient(conn)
-	defer client.Close()
+	return m[0]
+}
 
-	err = client.Call(rpcname, args, reply)
-	return err == nil
+func mapPBErr(errText string) kvraftapi.Err {
+	switch errText {
+	case string(kvraftapi.OK), "":
+		return kvraftapi.OK
+	case string(kvraftapi.ErrNoKey):
+		return kvraftapi.ErrNoKey
+	case string(kvraftapi.ErrWrongLeader):
+		return kvraftapi.ErrWrongLeader
+	case string(kvraftapi.ErrVersion):
+		return kvraftapi.ErrVersion
+	case string(kvraftapi.ErrMaybe):
+		return kvraftapi.ErrMaybe
+	default:
+		if strings.Contains(strings.ToLower(errText), "unimplemented") {
+			return kvraftapi.ErrWrongLeader
+		}
+		if strings.Contains(strings.ToLower(errText), "wrong") && strings.Contains(strings.ToLower(errText), "leader") {
+			return kvraftapi.ErrWrongLeader
+		}
+		return kvraftapi.ErrWrongLeader
+	}
 }
 
 // Get 获取一个键的当前值和版本。如果键不存在，返回 ErrNoKey。
 // 在面对所有其他错误时，它会不断重试。
-//
-// 你可以使用如下代码向服务器 i 发送 RPC：
-// ok := ck.clnt.Call(ck.servers[i], "KVServer.Get", &args, &reply)
 //
 // args 和 reply 的类型（包括它们是否为指针）必须与 RPC 处理函数的
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
@@ -118,16 +215,40 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 
 		candidates := ck.preferredCandidates(key)
 		for _, index := range candidates {
-			reply := kvraftapi.GetReply{}
-			ok := call(ck.servers[index], "KVServer.Get", &args, &reply)
+			addr := ck.grpcServers[index]
+			client, err := ck.getClient(addr)
+			if err != nil {
+				attempts++
+				continue
+			}
 
-			if ok {
-				ck.leader = index
-				switch reply.Err {
-				case kvraftapi.OK:
-					return reply.Value, reply.Version, reply.Err
-				case kvraftapi.ErrNoKey:
-					return "", 0, reply.Err
+			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			resp, rpcErr := client.Get(ctx, &pb.GetRequest{Key: args.Key})
+			cancel()
+
+			if rpcErr == nil && resp != nil {
+				errCode := mapPBErr(resp.GetError())
+				if errCode == kvraftapi.OK {
+					ck.leader = index
+					return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), kvraftapi.OK
+				}
+				if errCode == kvraftapi.ErrNoKey {
+					return "", 0, kvraftapi.ErrNoKey
+				}
+				if errCode == kvraftapi.ErrWrongLeader {
+					if leader := parseRedirectLeaderAddr(resp.GetError()); leader != "" {
+						leader = toGRPCAddress(leader)
+						if idx, ok := ck.serverToIdx[leader]; ok {
+							ck.leader = idx
+						}
+					}
+				}
+			} else if rpcErr != nil {
+				if leader := parseRedirectLeaderAddr(rpcErr.Error()); leader != "" {
+					leader = toGRPCAddress(leader)
+					if idx, ok := ck.serverToIdx[leader]; ok {
+						ck.leader = idx
+					}
 				}
 			}
 
@@ -173,20 +294,42 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 
 		candidates := ck.preferredCandidates(key)
 		for _, index := range candidates {
-			reply := kvraftapi.PutReply{}
-			ok := call(ck.servers[index], "KVServer.Put", &args, &reply)
-			if ok {
-				switch reply.Err {
+			addr := ck.grpcServers[index]
+			client, err := ck.getClient(addr)
+			if err != nil {
+				attempts++
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			resp, rpcErr := client.Put(ctx, &pb.PutRequest{Key: args.Key, Value: args.Value, Version: int64(args.Version)})
+			cancel()
+			if rpcErr == nil && resp != nil {
+				errCode := mapPBErr(resp.GetError())
+				switch errCode {
 				case kvraftapi.OK, kvraftapi.ErrNoKey:
 					ck.leader = index
-					return reply.Err
+					return errCode
 				case kvraftapi.ErrVersion:
 					ck.leader = index
 					if !retry {
 						return kvraftapi.ErrVersion
 					}
 					return kvraftapi.ErrMaybe
-				default: // kvraftapi.ErrWrongLeader
+				case kvraftapi.ErrWrongLeader:
+					if leader := parseRedirectLeaderAddr(resp.GetError()); leader != "" {
+						leader = toGRPCAddress(leader)
+						if idx, ok := ck.serverToIdx[leader]; ok {
+							ck.leader = idx
+						}
+					}
+				}
+			} else if rpcErr != nil {
+				if leader := parseRedirectLeaderAddr(rpcErr.Error()); leader != "" {
+					leader = toGRPCAddress(leader)
+					if idx, ok := ck.serverToIdx[leader]; ok {
+						ck.leader = idx
+					}
 				}
 			}
 
@@ -201,5 +344,57 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 
 		retry = true
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) Delete(key string) kvraftapi.Err {
+	timeout := time.After(10 * time.Second)
+	attempts := 0
+
+	for {
+		select {
+		case <-timeout:
+			return kvraftapi.ErrWrongLeader
+		default:
+		}
+
+		for _, index := range ck.preferredCandidates(key) {
+			addr := ck.grpcServers[index]
+			client, err := ck.getClient(addr)
+			if err != nil {
+				attempts++
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			resp, rpcErr := client.Delete(ctx, &pb.DeleteRequest{Key: key})
+			cancel()
+			if rpcErr == nil && resp != nil {
+				errCode := mapPBErr(resp.GetError())
+				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey {
+					ck.leader = index
+					return errCode
+				}
+			}
+
+			attempts++
+			if attempts > 100 {
+				return kvraftapi.ErrWrongLeader
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) Close() {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	for addr, conn := range ck.conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		delete(ck.conns, addr)
+		delete(ck.clients, addr)
 	}
 }
