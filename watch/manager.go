@@ -30,15 +30,15 @@ type Watcher struct {
 // Manager Watch管理器，实现发布-订阅模式
 // 支持：高并发、背压处理、超时清理、死信队列、统计收集
 type Manager struct {
-	mu              sync.RWMutex
-	watchers        map[int64]*Watcher
-	nextID          int64
-	eventCh         chan Event
-	deadLetterCh    chan Event
-	done            chan struct{}
-	config          ManagerConfig
-	stats           *Stats
-	processWg       sync.WaitGroup
+	mu           sync.RWMutex
+	watchers     map[int64]*Watcher
+	nextID       int64
+	eventCh      chan Event
+	deadLetterCh chan Event
+	done         chan struct{}
+	config       ManagerConfig
+	stats        *Stats
+	processWg    sync.WaitGroup
 }
 
 // ManagerConfig 配置
@@ -48,16 +48,16 @@ type ManagerConfig struct {
 	DLQSize           int
 	WatcherTimeout    time.Duration
 	HealthCheckTick   time.Duration
+	EnqueueTimeout    time.Duration
 }
 
 // Stats 统计信息
 type Stats struct {
-	TotalEvents      int64
-	SuccessfulSends  int64
-	FailedSends      int64
-	DroppedEvents    int64
-	ActiveWatchers   int64
-	mu               sync.RWMutex
+	TotalEvents     int64
+	SuccessfulSends int64
+	FailedSends     int64
+	DroppedEvents   int64
+	ActiveWatchers  int64
 }
 
 // DefaultConfig 默认配置
@@ -66,13 +66,30 @@ func DefaultConfig() ManagerConfig {
 		EventBufferSize:   1000,
 		WatcherBufferSize: 100,
 		DLQSize:           500,
-		WatcherTimeout:    5 * time.Minute,
+		WatcherTimeout:    0,
 		HealthCheckTick:   10 * time.Second,
+		EnqueueTimeout:    500 * time.Millisecond,
 	}
 }
 
 // NewManager 创建管理器
 func NewManager(cfg ManagerConfig) *Manager {
+	if cfg.EventBufferSize <= 0 {
+		cfg.EventBufferSize = 1000
+	}
+	if cfg.WatcherBufferSize <= 0 {
+		cfg.WatcherBufferSize = 100
+	}
+	if cfg.DLQSize <= 0 {
+		cfg.DLQSize = 500
+	}
+	if cfg.HealthCheckTick <= 0 {
+		cfg.HealthCheckTick = 10 * time.Second
+	}
+	if cfg.EnqueueTimeout <= 0 {
+		cfg.EnqueueTimeout = 500 * time.Millisecond
+	}
+
 	m := &Manager{
 		watchers:     make(map[int64]*Watcher),
 		nextID:       1,
@@ -143,13 +160,21 @@ func (m *Manager) Notify(key, oldVal, newVal string, ver int64, evType string) e
 	select {
 	case m.eventCh <- e:
 		return nil
+	case <-m.done:
+		return fmt.Errorf("watch manager closed")
 	default:
+		timer := time.NewTimer(m.config.EnqueueTimeout)
+		defer timer.Stop()
 		select {
 		case m.deadLetterCh <- e:
-			return fmt.Errorf("event queue full")
-		default:
+			return fmt.Errorf("event queued to dlq")
+		case m.eventCh <- e:
+			return nil
+		case <-timer.C:
 			atomic.AddInt64(&m.stats.DroppedEvents, 1)
-			return fmt.Errorf("dlq full")
+			return fmt.Errorf("enqueue timeout")
+		case <-m.done:
+			return fmt.Errorf("watch manager closed")
 		}
 	}
 }
@@ -161,6 +186,9 @@ func (m *Manager) processLoop() {
 	for {
 		select {
 		case e := <-m.eventCh:
+			atomic.AddInt64(&m.stats.TotalEvents, 1)
+			m.distributeEvent(e)
+		case e := <-m.deadLetterCh:
 			atomic.AddInt64(&m.stats.TotalEvents, 1)
 			m.distributeEvent(e)
 		case <-m.done:
@@ -217,6 +245,10 @@ func (m *Manager) healthCheckLoop() {
 
 // cleanupExpired 清理过期订阅者
 func (m *Manager) cleanupExpired() {
+	if m.config.WatcherTimeout <= 0 {
+		return
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -240,8 +272,6 @@ func (m *Manager) cleanupExpired() {
 
 // GetStats 获取统计
 func (m *Manager) GetStats() Stats {
-	m.stats.mu.RLock()
-	defer m.stats.mu.RUnlock()
 	return *m.stats
 }
 

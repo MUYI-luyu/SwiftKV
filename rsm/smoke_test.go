@@ -243,3 +243,68 @@ func TestWatchMechanism(t *testing.T) {
 	atomic.StoreInt32(&kv.dead, 1)
 	t.Log("✅ TestWatchMechanism 全部通过")
 }
+
+func TestWatchDeleteEvent(t *testing.T) {
+	store, err := storage.NewStore("test-db-watch-delete")
+	if err != nil {
+		t.Fatalf("❌ 创建 store 失败: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	if err := store.Clear(); err != nil {
+		t.Logf("⚠️ 清空 store 失败: %v (这在第一次运行时是正常的)", err)
+	}
+
+	watchMgr := watch.NewManager(watch.DefaultConfig())
+	defer watchMgr.Close()
+
+	kv := &KVServer{
+		me:    0,
+		dead:  0,
+		store: store,
+		stats: &ServerStats{},
+		rsm:   &RSM{watchMgr: watchMgr},
+	}
+
+	const key = "delete_watch_key"
+	if putRes := kv.DoOp(&kvraftapi.PutArgs{Key: key, Value: "before_delete", Version: 0}); putRes.(kvraftapi.PutReply).Err != kvraftapi.OK {
+		t.Fatalf("❌ 预置数据失败")
+	}
+
+	watcher, err := watchMgr.Subscribe(key, false)
+	if err != nil {
+		t.Fatalf("❌ Subscribe 失败: %v", err)
+	}
+	defer func() {
+		_ = watchMgr.Unsubscribe(watcher.ID)
+	}()
+
+	delArgs := &kvraftapi.DeleteArgs{Key: key}
+	delResult := kv.DoOp(delArgs)
+	delReply, ok := delResult.(kvraftapi.DeleteReply)
+	if !ok {
+		t.Fatalf("❌ Delete 返回类型错误，期望 DeleteReply，收到 %T", delResult)
+	}
+	if delReply.Err != kvraftapi.OK {
+		t.Fatalf("❌ Delete 失败，Err=%v", delReply.Err)
+	}
+
+	kv.OnOpComplete(delArgs, delReply, 2)
+
+	select {
+	case ev := <-watcher.Channel:
+		if ev.EventType != "DELETE" {
+			t.Fatalf("❌ 事件类型错误，期望 DELETE，收到 %q", ev.EventType)
+		}
+		if ev.OldValue != "before_delete" {
+			t.Fatalf("❌ 旧值错误，期望 before_delete，收到 %q", ev.OldValue)
+		}
+		if ev.NewValue != "" {
+			t.Fatalf("❌ 新值错误，期望空，收到 %q", ev.NewValue)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("❌ 等待 DELETE Watch 事件超时")
+	}
+}

@@ -41,9 +41,6 @@ RUN apk add --no-cache ca-certificates curl bash
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/kvraft-server /app/kvraft-server
 
-# 复制配置文件
-COPY config/ /etc/kvraft/
-
 # 创建数据目录
 RUN mkdir -p /data && chmod 777 /data
 

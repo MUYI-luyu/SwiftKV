@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +76,10 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.doDelete(t)
 	case kvraftapi.DeleteArgs:
 		return kv.doDelete(&t)
+	case *kvraftapi.ScanArgs:
+		return kv.doScan(t)
+	case kvraftapi.ScanArgs:
+		return kv.doScan(&t)
 	default:
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, t)
 		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
@@ -155,7 +161,7 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	_, _, exists, err := kv.store.Get(args.Key)
+	oldValue, _, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Delete: %v", kv.me, err)
 		kv.stats.RecordFailure()
@@ -172,7 +178,46 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 	}
 
 	kv.stats.RecordWrite()
-	return kvraftapi.DeleteReply{Err: kvraftapi.OK}
+	return kvraftapi.DeleteReply{Err: kvraftapi.OK, OldValue: oldValue}
+}
+
+func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
+	if kv.killed() {
+		return kvraftapi.ScanReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	all, err := kv.store.GetAll()
+	if err != nil {
+		log.Printf("[KVServer-%d] Scan GetAll error: %v", kv.me, err)
+		kv.stats.RecordFailure()
+		return kvraftapi.ScanReply{Err: kvraftapi.ErrWrongLeader}
+	}
+
+	keys := make([]string, 0, len(all))
+	for k := range all {
+		if args.Prefix == "" || strings.HasPrefix(k, args.Prefix) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	limit := int(args.Limit)
+	if limit <= 0 || limit > len(keys) {
+		limit = len(keys)
+	}
+
+	items := make([]kvraftapi.ScanItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		k := keys[i]
+		v := all[k]
+		items = append(items, kvraftapi.ScanItem{
+			Key:     k,
+			Value:   v.Value,
+			Version: kvraftapi.Tversion(v.Version),
+		})
+	}
+
+	return kvraftapi.ScanReply{Items: items, Err: kvraftapi.OK}
 }
 
 // ============================================================
@@ -277,6 +322,10 @@ func (kv *KVServer) OnOpComplete(req any, result any, index int64) {
 		kv.notifyPutEvent(t, result, watchMgr)
 	case kvraftapi.PutArgs:
 		kv.notifyPutEvent(&t, result, watchMgr)
+	case *kvraftapi.DeleteArgs:
+		kv.notifyDeleteEvent(t, result, watchMgr)
+	case kvraftapi.DeleteArgs:
+		kv.notifyDeleteEvent(&t, result, watchMgr)
 	}
 }
 
@@ -310,6 +359,27 @@ func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watch
 	}
 }
 
+func (kv *KVServer) notifyDeleteEvent(delArgs *kvraftapi.DeleteArgs, result any, watchMgr *watch.Manager) {
+	delReply, ok := result.(kvraftapi.DeleteReply)
+	if !ok {
+		return
+	}
+	if delReply.Err != kvraftapi.OK {
+		return
+	}
+
+	err := watchMgr.Notify(
+		delArgs.Key,
+		delReply.OldValue,
+		"",
+		0,
+		"DELETE",
+	)
+	if err == nil {
+		kv.stats.RecordWatchNotify()
+	}
+}
+
 // ============================================================
 // 生命周期管理
 // ============================================================
@@ -337,6 +407,20 @@ func (kv *KVServer) Kill() {
 
 func (kv *KVServer) killed() bool {
 	return atomic.LoadInt32(&kv.dead) == 1
+}
+
+func (kv *KVServer) IsAlive() bool {
+	return !kv.killed()
+}
+
+func (kv *KVServer) StatsSnapshot() ServerStats {
+	return ServerStats{
+		TotalRequests:  atomic.LoadInt64(&kv.stats.TotalRequests),
+		TotalWrites:    atomic.LoadInt64(&kv.stats.TotalWrites),
+		TotalReads:     atomic.LoadInt64(&kv.stats.TotalReads),
+		FailedRequests: atomic.LoadInt64(&kv.stats.FailedRequests),
+		WatchNotifies:  atomic.LoadInt64(&kv.stats.WatchNotifies),
+	}
 }
 
 // ============================================================
@@ -377,6 +461,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	gob.Register(kvraftapi.PutArgs{})
 	gob.Register(kvraftapi.GetArgs{})
 	gob.Register(kvraftapi.DeleteArgs{})
+	gob.Register(kvraftapi.ScanArgs{})
 
 	store, err := storage.NewStore("badger-" + address)
 	if err != nil {

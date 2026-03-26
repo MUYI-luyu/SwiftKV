@@ -79,7 +79,6 @@ services:
       - "9100:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-0:/data
-      - ./config:/etc/kvraft:ro
     depends_on:
       - consul
     networks:
@@ -111,7 +110,6 @@ services:
       - "9101:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-1:/data
-      - ./config:/etc/kvraft:ro
     depends_on:
       - consul
     networks:
@@ -143,7 +141,6 @@ services:
       - "9102:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-2:/data
-      - ./config:/etc/kvraft:ro
     depends_on:
       - consul
     networks:

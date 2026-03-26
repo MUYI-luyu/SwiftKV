@@ -38,5 +38,22 @@ type DeleteArgs struct {
 }
 
 type DeleteReply struct {
-	Err Err
+	Err      Err
+	OldValue string
+}
+
+type ScanArgs struct {
+	Prefix string
+	Limit  int32
+}
+
+type ScanItem struct {
+	Key     string
+	Value   string
+	Version Tversion
+}
+
+type ScanReply struct {
+	Items []ScanItem
+	Err   Err
 }

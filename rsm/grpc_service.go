@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sort"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +25,9 @@ type grpcKVService struct {
 }
 
 func grpcAddrFromRPC(addr string) string {
+	if explicit := strings.TrimSpace(os.Getenv("GRPC_LISTEN")); explicit != "" {
+		return explicit
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return addr
@@ -104,33 +107,22 @@ func (s *grpcKVService) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.Scan
 		return &pb.ScanResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
 	}
 
-	all, err := s.kv.store.GetAll()
-	if err != nil {
-		return &pb.ScanResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
+	err, ret := s.kv.rsm.Submit(&kvraftapi.ScanArgs{Prefix: req.GetPrefix(), Limit: req.GetLimit()})
+	if err != kvraftapi.OK {
+		return &pb.ScanResponse{Error: errReply(err)}, nil
 	}
 
-	prefix := req.GetPrefix()
-	keys := make([]string, 0, len(all))
-	for k := range all {
-		if prefix == "" || strings.HasPrefix(k, prefix) {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-
-	limit := int(req.GetLimit())
-	if limit <= 0 || limit > len(keys) {
-		limit = len(keys)
+	reply, ok := ret.(kvraftapi.ScanReply)
+	if !ok {
+		return &pb.ScanResponse{Error: "ErrInternal"}, nil
 	}
 
-	items := make([]*pb.KeyValue, 0, limit)
-	for i := 0; i < limit; i++ {
-		k := keys[i]
-		v := all[k]
-		items = append(items, &pb.KeyValue{Key: k, Value: v.Value, Version: int64(v.Version)})
+	items := make([]*pb.KeyValue, 0, len(reply.Items))
+	for _, it := range reply.Items {
+		items = append(items, &pb.KeyValue{Key: it.Key, Value: it.Value, Version: int64(it.Version)})
 	}
 
-	return &pb.ScanResponse{Items: items, Error: errReply(kvraftapi.OK)}, nil
+	return &pb.ScanResponse{Items: items, Error: errReply(reply.Err)}, nil
 }
 
 func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, pb.WatchEvent]) error {

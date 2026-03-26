@@ -21,6 +21,7 @@ type testKVService struct {
 	mu                sync.Mutex
 	kv                map[string]*pb.KeyValue
 	alwaysWrongLeader bool
+	failDelete        bool
 }
 
 func (s *testKVService) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
@@ -67,6 +68,9 @@ func (s *testKVService) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.De
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failDelete {
+		return &pb.DeleteResponse{Error: "ErrInternal"}, nil
+	}
 	if _, ok := s.kv[req.GetKey()]; !ok {
 		return &pb.DeleteResponse{Error: "ErrNoKey"}, nil
 	}

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/dgraph-io/badger/v3"
 )
@@ -17,8 +19,17 @@ type kvEntry struct {
 
 // Store 是基于BadgerDB的持久化存储实现
 type Store struct {
+	mu     sync.RWMutex
 	db     *badger.DB
 	dbPath string
+}
+
+func badgerOptions(dbPath string) badger.Options {
+	return badger.DefaultOptions(dbPath).WithLoggingLevel(badger.WARNING)
+}
+
+func openBadger(dbPath string) (*badger.DB, error) {
+	return badger.Open(badgerOptions(dbPath))
 }
 
 // NewStore 创建一个新的Store实例
@@ -31,10 +42,7 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 
 	// 打开BadgerDB数据库
-	opts := badger.DefaultOptions(dbPath).
-		WithLoggingLevel(badger.WARNING)
-
-	db, err := badger.Open(opts)
+	db, err := openBadger(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("打开BadgerDB失败: %w", err)
 	}
@@ -47,6 +55,9 @@ func NewStore(dbPath string) (*Store, error) {
 
 // Get 从存储中读取一个键的值和版本
 func (s *Store) Get(key string) (value string, version uint64, exists bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	err = s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(key))
 		if err == badger.ErrKeyNotFound {
@@ -77,6 +88,9 @@ func (s *Store) Get(key string) (value string, version uint64, exists bool, err 
 
 // Put 将一个键值对存储到持久化存储中
 func (s *Store) Put(key, value string, version uint64) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	entry := kvEntry{
 		Value:   value,
 		Version: version,
@@ -94,6 +108,9 @@ func (s *Store) Put(key, value string, version uint64) error {
 
 // Delete 从存储中删除一个键
 func (s *Store) Delete(key string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
@@ -101,6 +118,9 @@ func (s *Store) Delete(key string) error {
 
 // GetAll 获取所有键值对（用于加载快照或导出）
 func (s *Store) GetAll() (map[string]kvEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	data := make(map[string]kvEntry)
 
 	err := s.db.View(func(txn *badger.Txn) error {
@@ -139,18 +159,81 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("反序列化快照失败: %w", err)
 	}
 
-	// 清空现有数据
-	if err := s.db.DropAll(); err != nil {
-		return fmt.Errorf("清空数据库失败: %w", err)
+	tmpPath := fmt.Sprintf("%s.restore.%d", s.dbPath, time.Now().UnixNano())
+	backupPath := fmt.Sprintf("%s.backup.%d", s.dbPath, time.Now().UnixNano())
+
+	if err := os.RemoveAll(tmpPath); err != nil {
+		return fmt.Errorf("清理临时恢复目录失败: %w", err)
 	}
 
-	// 写入快照数据
+	tmpDB, err := openBadger(tmpPath)
+	if err != nil {
+		return fmt.Errorf("打开临时恢复数据库失败: %w", err)
+	}
+
 	for key, entry := range snapshot {
-		if err := s.Put(key, entry.Value, entry.Version); err != nil {
-			return err
+		entryCopy := entry
+		data, marshalErr := json.Marshal(entryCopy)
+		if marshalErr != nil {
+			_ = tmpDB.Close()
+			_ = os.RemoveAll(tmpPath)
+			return fmt.Errorf("序列化快照条目失败: %w", marshalErr)
+		}
+		if putErr := tmpDB.Update(func(txn *badger.Txn) error {
+			return txn.Set([]byte(key), data)
+		}); putErr != nil {
+			_ = tmpDB.Close()
+			_ = os.RemoveAll(tmpPath)
+			return fmt.Errorf("写入临时恢复数据库失败: %w", putErr)
 		}
 	}
 
+	if err := tmpDB.Close(); err != nil {
+		_ = os.RemoveAll(tmpPath)
+		return fmt.Errorf("关闭临时恢复数据库失败: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db != nil {
+		if err := s.db.Close(); err != nil {
+			_ = os.RemoveAll(tmpPath)
+			return fmt.Errorf("关闭当前数据库失败: %w", err)
+		}
+		s.db = nil
+	}
+
+	if err := os.RemoveAll(backupPath); err != nil {
+		_ = os.RemoveAll(tmpPath)
+		return fmt.Errorf("清理旧备份目录失败: %w", err)
+	}
+
+	if _, err := os.Stat(s.dbPath); err == nil {
+		if err := os.Rename(s.dbPath, backupPath); err != nil {
+			_ = os.RemoveAll(tmpPath)
+			return fmt.Errorf("备份当前数据库失败: %w", err)
+		}
+	}
+
+	if err := os.Rename(tmpPath, s.dbPath); err != nil {
+		_ = os.Rename(backupPath, s.dbPath)
+		return fmt.Errorf("切换恢复数据库失败: %w", err)
+	}
+
+	newDB, err := openBadger(s.dbPath)
+	if err != nil {
+		_ = os.RemoveAll(s.dbPath)
+		_ = os.Rename(backupPath, s.dbPath)
+		fallbackDB, fallbackErr := openBadger(s.dbPath)
+		if fallbackErr == nil {
+			s.db = fallbackDB
+		}
+		return fmt.Errorf("恢复后重新打开数据库失败: %w", err)
+	}
+
+	s.db = newDB
+	_ = os.RemoveAll(backupPath)
 	return nil
 }
 
@@ -166,6 +249,9 @@ func (s *Store) SaveSnapshot() ([]byte, error) {
 
 // Close 关闭数据库连接
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.db != nil {
 		return s.db.Close()
 	}
@@ -179,6 +265,9 @@ func (s *Store) GetStats() string {
 
 // Clear 清空所有数据（用于测试）
 func (s *Store) Clear() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	return s.db.DropAll()
 }
 
