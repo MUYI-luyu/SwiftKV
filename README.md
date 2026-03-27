@@ -4,7 +4,7 @@ KVraft 是一个基于 Go 的高性能分布式键值存储系统，采用 Raft 
 
 ## 核心亮点
 
-- 强一致写入路径：Client -> RSM -> Raft -> Apply -> Storage
+- 强一致写入路径：Client → RSM (KVServer) → Raft (Start) → Raft → ApplyCh → RSM (Apply Loop) → Storage (Badger)
 - 版本化 CAS 语义：避免并发覆盖写
 - gRPC 服务接口：统一对外读写与集群状态访问
 - Watch 机制：支持按 key/prefix 订阅变更
