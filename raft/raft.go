@@ -70,6 +70,8 @@ type Raft struct {
 
 	heartbeatInterval time.Duration
 	replicateTrigger  chan struct{}
+	leaseRatio        float64
+	leaseUntil        time.Time
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
@@ -131,6 +133,16 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.CurrentTerm, rf.state == Leader
+}
+
+// IsLeaderWithLease returns true only when this node is leader and the lease is still valid.
+func (rf *Raft) IsLeaderWithLease() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader || rf.killed() {
+		return false
+	}
+	return time.Now().Before(rf.leaseUntil)
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -658,6 +670,8 @@ func (rf *Raft) sendHeartbeats() {
 	}
 	rf.mu.Unlock()
 
+	var successCount int32 = 1 // leader itself
+
 	// 向每个 Follower 发送心跳或日志同步
 	for i := range rf.peers {
 		if i == rf.me {
@@ -779,6 +793,11 @@ func (rf *Raft) sendHeartbeats() {
 			if reply.Success {
 				rf.matchIndex[server] = prevIndex + len(entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
+				n := atomic.AddInt32(&successCount, 1)
+				if n > int32(len(rf.peers)/2) {
+					d := time.Duration(float64(rf.heartbeatInterval) * rf.leaseRatio)
+					rf.leaseUntil = time.Now().Add(d)
+				}
 			} else {
 				if reply.ConflictTerm == -1 {
 					// follower 太短
@@ -865,6 +884,8 @@ func (rf *Raft) leaderLoop() {
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
+	d := time.Duration(float64(rf.heartbeatInterval) * rf.leaseRatio)
+	rf.leaseUntil = time.Now().Add(d)
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		rf.matchIndex[i] = 0
@@ -1035,6 +1056,8 @@ func Make(peers []string, me int,
 	rf.rpcClients = make(map[string]*rpc.Client, len(peers))
 	rf.heartbeatInterval = 80 * time.Millisecond
 	rf.replicateTrigger = make(chan struct{}, 1)
+	rf.leaseRatio = 1.5
+	rf.leaseUntil = time.Now()
 
 	// 你的初始化代码在这里 (3A, 3B, 3C)。
 

@@ -1,39 +1,143 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-cd /home/jianger/codes/KVraft
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-echo "=== 1. 初始化 Git 仓库 ==="
-if [ ! -d .git ]; then
-    git init
-    echo "✓ Git 仓库已初始化"
+COMMIT_MSG="chore: sync project updates"
+RUN_TEST=1
+DRY_RUN=0
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash push-to-github.sh [-m "commit message"] [--no-test] [--dry-run]
+
+Options:
+  -m, --message   Commit message
+  --no-test       Skip test step
+  --dry-run       Show staged changes without commit/push
+  -h, --help      Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m|--message)
+            COMMIT_MSG="${2:-}"
+            shift 2
+            ;;
+        --no-test)
+            RUN_TEST=0
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ ! -d .git ]]; then
+    echo "Error: not a git repository: ${SCRIPT_DIR}"
+    exit 1
+fi
+
+if [[ -z "${COMMIT_MSG}" ]]; then
+    echo "Error: commit message cannot be empty"
+    exit 1
+fi
+
+if ! git remote get-url origin >/dev/null 2>&1; then
+    echo "Error: remote 'origin' is not configured"
+    echo "Hint: git remote add origin <your-repo-url>"
+    exit 1
+fi
+
+if [[ ${RUN_TEST} -eq 1 ]]; then
+    echo "=== 1/4 Run tests ==="
+    go test ./...
 else
-    echo "✓ Git 仓库已存在"
+    echo "=== 1/4 Skip tests (--no-test) ==="
 fi
 
 echo ""
-echo "=== 2. 暂存所有关键文件 ==="
+echo "=== 2/4 Stage source files ==="
+PATHS=(
+    .gitignore
+    README.md
+    push-to-github.sh
+    go.mod
+    go.sum
+    go.work
+    go.work.sum
+    Dockerfile
+    Dockerfile.benchmark
+    docker-compose.yml
+    prometheus.yml
+    api
+    cmd
+    examples
+    raft
+    raftapi
+    raftkv
+    rsm
+    sharding
+    storage
+    wal
+    watch
+)
 
-git add .gitignore
-git add go.mod go.sum go.work go.work.sum
-git add raft/ rsm/ storage/ watch/ sharding/ raftapi/
-git add api/ raftkv/ examples/
-git add cmd/ README.md
-git add Dockerfile docker-compose.yml
+for path in "${PATHS[@]}"; do
+    if [[ -e "${path}" ]]; then
+        git add "${path}"
+    fi
+done
 
-echo "✓ 文件暂存完成"
+if [[ -f "benchmarks/benchmark.go" ]]; then
+    git add "benchmarks/benchmark.go"
+fi
+if [[ -f "benchmarks/run.sh" ]]; then
+    git add "benchmarks/run.sh"
+fi
+
+# Avoid committing local benchmark binary artifacts.
+git reset -q -- benchmarks/benchmark 2>/dev/null || true
+
+if git diff --cached --quiet; then
+    echo "No staged source changes. Nothing to commit."
+    exit 0
+fi
 
 echo ""
-echo "=== 3. 查看待提交文件 ==="
-git status
+echo "=== 3/4 Review staged changes ==="
+git status --short
+
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    echo ""
+    echo "Dry run enabled. Skipping commit and push."
+    exit 0
+fi
 
 echo ""
-echo "=== 4. 提交代码 ==="
-git commit -m "chore: sync project updates"
+echo "=== 4/4 Commit and push ==="
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "${CURRENT_BRANCH}" == "HEAD" ]]; then
+    echo "Error: detached HEAD. Please checkout a branch first."
+    exit 1
+fi
+
+git commit -m "${COMMIT_MSG}"
+git push -u origin "${CURRENT_BRANCH}"
 
 echo ""
-echo "=== 5. 推送至 GitHub ==="
-git push -u origin main
-
-echo ""
-echo "推送完成！"
+echo "Push completed on branch: ${CURRENT_BRANCH}"

@@ -4,8 +4,14 @@
 
 set -e
 
-PROTO_DIR="./api/pb"
-OUTPUT_DIR="./api/pb"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROTO_DIR="${PROJECT_ROOT}/api/pb"
+OUTPUT_DIR="${PROJECT_ROOT}"
+MODULE_NAME="kvraft"
+
+# 确保 protoc 能找到 Go 插件
+export PATH="$(go env GOPATH)/bin:$PATH"
 
 echo "🔨 正在编译 Proto 文件..."
 
@@ -19,12 +25,12 @@ if ! command -v protoc &> /dev/null; then
 fi
 
 # 检查 Go 插件
-if ! go list -m google.golang.org/protobuf &>/dev/null; then
+if ! command -v protoc-gen-go &>/dev/null; then
     echo "📦 安装 protoc-gen-go..."
     go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 fi
 
-if ! go list -m google.golang.org/grpc &>/dev/null; then
+if ! command -v protoc-gen-go-grpc &>/dev/null; then
     echo "📦 安装 protoc-gen-go-grpc..."
     go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 fi
@@ -33,12 +39,12 @@ fi
 echo "📝 编译 kvraft.proto..."
 protoc \
     --go_out="${OUTPUT_DIR}" \
-    --go_opt=paths=source_relative \
+    --go_opt="module=${MODULE_NAME}" \
     --go-grpc_out="${OUTPUT_DIR}" \
-    --go-grpc_opt=paths=source_relative \
+    --go-grpc_opt="module=${MODULE_NAME}" \
     -I"${PROTO_DIR}" \
     "${PROTO_DIR}/kvraft.proto"
 
 echo "✅ Proto 编译完成！"
 echo "📍 生成文件："
-ls -lh "${OUTPUT_DIR}"/*.pb.go 2>/dev/null || echo "  (生成的文件还未出现)"
+ls -lh "${PROJECT_ROOT}/api/pb/kvraft/api/pb"/*.pb.go 2>/dev/null || echo "  (生成的文件还未出现)"

@@ -48,7 +48,7 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 		return &pb.GetResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.Submit(&kvraftapi.GetArgs{Key: req.GetKey()})
+	err, ret := s.kv.rsm.SubmitLeaseRead(&kvraftapi.GetArgs{Key: req.GetKey()})
 	if err != kvraftapi.OK {
 		return &pb.GetResponse{Error: errReply(err)}, nil
 	}
@@ -62,6 +62,7 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 		Value:   reply.Value,
 		Version: int64(reply.Version),
 		Error:   errReply(reply.Err),
+		Expires: reply.Expires,
 	}, nil
 }
 
@@ -70,7 +71,7 @@ func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRes
 		return &pb.PutResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
 	}
 
-	args := &kvraftapi.PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: kvraftapi.Tversion(req.GetVersion())}
+	args := &kvraftapi.PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: kvraftapi.Tversion(req.GetVersion()), TTL: req.GetTtlSeconds()}
 	err, ret := s.kv.rsm.Submit(args)
 	if err != kvraftapi.OK {
 		return &pb.PutResponse{Error: errReply(err)}, nil
@@ -119,7 +120,7 @@ func (s *grpcKVService) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.Scan
 
 	items := make([]*pb.KeyValue, 0, len(reply.Items))
 	for _, it := range reply.Items {
-		items = append(items, &pb.KeyValue{Key: it.Key, Value: it.Value, Version: int64(it.Version)})
+		items = append(items, &pb.KeyValue{Key: it.Key, Value: it.Value, Version: int64(it.Version), Expires: it.Expires})
 	}
 
 	return &pb.ScanResponse{Items: items, Error: errReply(reply.Err)}, nil

@@ -568,10 +568,16 @@ func (ck *Clerk) Watch(key string, prefix bool) (*WatchSubscription, error) {
 				if event == nil {
 					return
 				}
-				ev := *event
-				ev.EventType = fmt.Sprintf("group-%d:%s", groupID, event.GetEventType())
+				ev := &pb.WatchEvent{
+					WatchId:    event.GetWatchId(),
+					Key:        event.GetKey(),
+					OldValue:   event.GetOldValue(),
+					NewValue:   event.GetNewValue(),
+					NewVersion: event.GetNewVersion(),
+					EventType:  fmt.Sprintf("group-%d:%s", groupID, event.GetEventType()),
+				}
 				select {
-				case out <- &ev:
+				case out <- ev:
 				case <-ctx.Done():
 				}
 			})

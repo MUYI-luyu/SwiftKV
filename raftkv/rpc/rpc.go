@@ -19,6 +19,7 @@ type GetArgs struct {
 type GetReply struct {
 	Value   string
 	Version Tversion
+	Expires int64
 	Err     Err
 }
 
@@ -26,6 +27,7 @@ type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+	TTL     int64 // seconds; <=0 means no expiry
 }
 
 type PutReply struct {
@@ -51,9 +53,20 @@ type ScanItem struct {
 	Key     string
 	Value   string
 	Version Tversion
+	Expires int64
 }
 
 type ScanReply struct {
 	Items []ScanItem
 	Err   Err
+}
+
+type ExpireArgs struct {
+	Keys   []string
+	Cutoff int64
+}
+
+type ExpireReply struct {
+	ExpiredKeys []string
+	Err         Err
 }

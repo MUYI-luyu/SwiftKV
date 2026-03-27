@@ -3,6 +3,9 @@ package rsm
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
+	"log"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"kvraft/raft"
 	raftapi "kvraft/raftapi"
 	kvraftapi "kvraft/raftkv/rpc"
+	"kvraft/wal"
 	"kvraft/watch"
 )
 
@@ -77,6 +81,8 @@ type RSM struct {
 	shutdown   atomic.Bool
 	watchMgr   *watch.Manager     // Watch 管理器
 	opListener OpCompleteListener // 操作完成监听器（用于 Watch 回调）
+	walLogger  *wal.Logger
+	leaseRead  atomic.Bool
 }
 
 // Close 优雅关闭 RSM 相关后台组件。
@@ -90,6 +96,11 @@ func (rsm *RSM) Close() {
 	}
 	if rsm.watchMgr != nil {
 		rsm.watchMgr.Close()
+	}
+	if rsm.walLogger != nil {
+		if err := rsm.walLogger.Close(); err != nil {
+			log.Printf("[RSM-%d] close WAL failed: %v", rsm.me, err)
+		}
 	}
 
 	rsm.mu.Lock()
@@ -136,6 +147,14 @@ func MakeRSM(
 		watchMgr:     watch.NewManager(watch.DefaultConfig()),
 	}
 	rsm.shutdown.Store(false)
+	rsm.leaseRead.Store(true)
+	walPath := filepath.Join("wal", fmt.Sprintf("rsm-node-%d.log", me))
+	walLogger, err := wal.NewLogger(walPath, true)
+	if err != nil {
+		log.Printf("[RSM-%d] WAL disabled due to init error: %v", me, err)
+	} else {
+		rsm.walLogger = walLogger
+	}
 	rsm.rf = raft.Make(peers, me, persister, rsm.applyCh)
 	if maxraftstate != -1 {
 		snapshot := persister.ReadSnapshot()
@@ -162,6 +181,63 @@ func (rsm *RSM) genID() int64 {
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
+}
+
+func (rsm *RSM) EnableLeaseRead(enable bool) {
+	rsm.leaseRead.Store(enable)
+}
+
+// SubmitLeaseRead tries local lease read first, then falls back to consensus path.
+func (rsm *RSM) SubmitLeaseRead(req any) (kvraftapi.Err, any) {
+	if !rsm.leaseRead.Load() {
+		return rsm.Submit(req)
+	}
+	rfImpl, ok := rsm.rf.(*raft.Raft)
+	if !ok {
+		return rsm.Submit(req)
+	}
+	if rfImpl.IsLeaderWithLease() {
+		result := rsm.sm.DoOp(req)
+		return kvraftapi.OK, result
+	}
+	return rsm.Submit(req)
+}
+
+func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
+	entry := wal.Entry{
+		RaftIndex: int64(commandIndex),
+		Term:      term,
+		NodeID:    me,
+		ReqID:     oper.Id,
+		Timestamp: time.Now().UnixNano(),
+	}
+	switch t := oper.Req.(type) {
+	case *kvraftapi.GetArgs:
+		entry.OpType = "GET"
+		entry.Key = t.Key
+	case kvraftapi.GetArgs:
+		entry.OpType = "GET"
+		entry.Key = t.Key
+	case *kvraftapi.PutArgs:
+		entry.OpType = "PUT"
+		entry.Key = t.Key
+	case kvraftapi.PutArgs:
+		entry.OpType = "PUT"
+		entry.Key = t.Key
+	case *kvraftapi.DeleteArgs:
+		entry.OpType = "DELETE"
+		entry.Key = t.Key
+	case kvraftapi.DeleteArgs:
+		entry.OpType = "DELETE"
+		entry.Key = t.Key
+	case *kvraftapi.ExpireArgs:
+		entry.OpType = "EXPIRE"
+	case kvraftapi.ExpireArgs:
+		entry.OpType = "EXPIRE"
+	default:
+		entry.OpType = fmt.Sprintf("%T", oper.Req)
+	}
+	return entry
 }
 
 // GetWatchManager 返回 Watch 管理器
@@ -284,6 +360,13 @@ func (rsm *RSM) applyCommand(msg raftapi.ApplyMsg) {
 		return
 	}
 
+	term, _ := rsm.rf.GetState()
+	if rsm.walLogger != nil {
+		if err := rsm.walLogger.Append(walEntryFromOp(rsm.me, msg.CommandIndex, term, oper)); err != nil {
+			log.Printf("[RSM-%d] WAL append failed at index=%d: %v", rsm.me, msg.CommandIndex, err)
+		}
+	}
+
 	result := rsm.sm.DoOp(oper.Req)
 
 	// ============================================================
@@ -351,4 +434,9 @@ func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
 	e.Encode(idctr)
 	e.Encode(smSnapshot)
 	rsm.rf.Snapshot(lastIncludedIndex, w.Bytes())
+	if rsm.walLogger != nil {
+		if err := rsm.walLogger.TruncateUpTo(int64(lastIncludedIndex)); err != nil {
+			log.Printf("[RSM-%d] WAL truncate failed at snapshot index=%d: %v", rsm.me, lastIncludedIndex, err)
+		}
+	}
 }

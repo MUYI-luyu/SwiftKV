@@ -15,6 +15,7 @@ import (
 type kvEntry struct {
 	Value   string `json:"value"`
 	Version uint64 `json:"version"`
+	Expires int64  `json:"expires"`
 }
 
 // Store 是基于BadgerDB的持久化存储实现
@@ -55,6 +56,12 @@ func NewStore(dbPath string) (*Store, error) {
 
 // Get 从存储中读取一个键的值和版本
 func (s *Store) Get(key string) (value string, version uint64, exists bool, err error) {
+	value, version, _, exists, err = s.GetWithMeta(key)
+	return
+}
+
+// GetWithMeta returns value/version and raw expiry timestamp.
+func (s *Store) GetWithMeta(key string) (value string, version uint64, expires int64, exists bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -79,6 +86,7 @@ func (s *Store) Get(key string) (value string, version uint64, exists bool, err 
 
 		value = entry.Value
 		version = entry.Version
+		expires = entry.Expires
 		exists = true
 		return nil
 	})
@@ -88,12 +96,18 @@ func (s *Store) Get(key string) (value string, version uint64, exists bool, err 
 
 // Put 将一个键值对存储到持久化存储中
 func (s *Store) Put(key, value string, version uint64) error {
+	return s.PutWithTTL(key, value, version, 0)
+}
+
+// PutWithTTL stores key/value/version with optional absolute expiry unix nano.
+func (s *Store) PutWithTTL(key, value string, version uint64, expires int64) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	entry := kvEntry{
 		Value:   value,
 		Version: version,
+		Expires: expires,
 	}
 
 	data, err := json.Marshal(entry)
@@ -104,6 +118,43 @@ func (s *Store) Put(key, value string, version uint64) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(key), data)
 	})
+}
+
+// GetExpiredKeys returns keys whose expiry is <= cutoff.
+func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 128
+	}
+	keys := make([]string, 0, limit)
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			if len(keys) >= limit {
+				break
+			}
+			item := it.Item()
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			var entry kvEntry
+			if err := json.Unmarshal(val, &entry); err != nil {
+				continue
+			}
+			if entry.Expires > 0 && entry.Expires <= cutoff {
+				keys = append(keys, string(item.Key()))
+			}
+		}
+		return nil
+	})
+	return keys, err
 }
 
 // Delete 从存储中删除一个键

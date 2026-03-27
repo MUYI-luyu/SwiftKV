@@ -17,6 +17,17 @@ import (
 	"google.golang.org/grpc"
 )
 
+func isExpired(expires int64, now int64) bool {
+	return expires > 0 && expires <= now
+}
+
+func absoluteExpiryFromTTL(ttlSeconds int64, now int64) int64 {
+	if ttlSeconds <= 0 {
+		return 0
+	}
+	return now + ttlSeconds*int64(time.Second)
+}
+
 // ============================================================
 // KVServer - 高性能分布式键值存储服务器
 // 集成特性：BadgerDB 存储、Watch 实时推送、性能统计
@@ -35,16 +46,18 @@ type OperationInfo struct {
 }
 
 type KVServer struct {
-	me      int
-	dead    int32
-	address string
-	rsm     *RSM
-	mu      sync.RWMutex
-	store   *storage.Store
-	stats   *ServerStats
-	rpcLn   net.Listener
-	grpcLn  net.Listener
-	grpcSrv *grpc.Server
+	me       int
+	dead     int32
+	address  string
+	rsm      *RSM
+	mu       sync.RWMutex
+	store    *storage.Store
+	stats    *ServerStats
+	ttlEvery time.Duration
+	ttlBatch int
+	rpcLn    net.Listener
+	grpcLn   net.Listener
+	grpcSrv  *grpc.Server
 }
 
 type ServerStats struct {
@@ -53,6 +66,9 @@ type ServerStats struct {
 	TotalReads     int64
 	FailedRequests int64
 	WatchNotifies  int64
+	LeaseHits      int64
+	LeaseFallbacks int64
+	TTLExpiredOps  int64
 }
 
 // ============================================================
@@ -80,6 +96,10 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.doScan(t)
 	case kvraftapi.ScanArgs:
 		return kv.doScan(&t)
+	case *kvraftapi.ExpireArgs:
+		return kv.doExpire(t)
+	case kvraftapi.ExpireArgs:
+		return kv.doExpire(&t)
 	default:
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, t)
 		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
@@ -93,17 +113,23 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	}
 
 	// 存储查询（BadgerDB 的 BlockCache 会处理热数据缓存）
-	value, version, exists, err := kv.store.Get(args.Key)
+	now := time.Now().UnixNano()
+	value, version, expires, exists, err := kv.store.GetWithMeta(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error: %v", kv.me, err)
 		kv.stats.RecordFailure()
 		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	if exists {
+	if exists && !isExpired(expires, now) {
+		remaining := int64(0)
+		if expires > 0 {
+			remaining = expires - now
+		}
 		return kvraftapi.GetReply{
 			Value:   value,
 			Version: kvraftapi.Tversion(version),
+			Expires: remaining,
 			Err:     kvraftapi.OK,
 		}
 	}
@@ -118,17 +144,24 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 	}
 
 	// 获取当前值，用于Watch事件
-	oldValue, version, exists, err := kv.store.Get(args.Key)
+	now := time.Now().UnixNano()
+	oldValue, version, oldExpires, exists, err := kv.store.GetWithMeta(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Put: %v", kv.me, err)
 		kv.stats.RecordFailure()
 		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 	}
+	if exists && isExpired(oldExpires, now) {
+		exists = false
+		oldValue = ""
+		version = 0
+	}
+	newExpires := absoluteExpiryFromTTL(args.TTL, now)
 
 	if exists {
 		if kvraftapi.Tversion(version) == args.Version {
 			newVersion := version + 1
-			if err := kv.store.Put(args.Key, args.Value, newVersion); err != nil {
+			if err := kv.store.PutWithTTL(args.Key, args.Value, newVersion, newExpires); err != nil {
 				log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
 				kv.stats.RecordFailure()
 				return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
@@ -142,7 +175,7 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 	}
 
 	if args.Version == 0 {
-		if err := kv.store.Put(args.Key, args.Value, 1); err != nil {
+		if err := kv.store.PutWithTTL(args.Key, args.Value, 1, newExpires); err != nil {
 			log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
 			kv.stats.RecordFailure()
 			return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
@@ -161,11 +194,15 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	oldValue, _, exists, err := kv.store.Get(args.Key)
+	now := time.Now().UnixNano()
+	oldValue, _, expires, exists, err := kv.store.GetWithMeta(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Delete: %v", kv.me, err)
 		kv.stats.RecordFailure()
 		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+	}
+	if exists && isExpired(expires, now) {
+		exists = false
 	}
 	if !exists {
 		return kvraftapi.DeleteReply{Err: kvraftapi.ErrNoKey}
@@ -210,14 +247,50 @@ func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
 	for i := 0; i < limit; i++ {
 		k := keys[i]
 		v := all[k]
+		now := time.Now().UnixNano()
+		if isExpired(v.Expires, now) {
+			continue
+		}
 		items = append(items, kvraftapi.ScanItem{
 			Key:     k,
 			Value:   v.Value,
 			Version: kvraftapi.Tversion(v.Version),
+			Expires: v.Expires,
 		})
+		if len(items) >= limit {
+			break
+		}
 	}
 
 	return kvraftapi.ScanReply{Items: items, Err: kvraftapi.OK}
+}
+
+func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
+	if kv.killed() {
+		return kvraftapi.ExpireReply{Err: kvraftapi.ErrWrongLeader}
+	}
+	if len(args.Keys) == 0 {
+		return kvraftapi.ExpireReply{Err: kvraftapi.OK}
+	}
+
+	expired := make([]string, 0, len(args.Keys))
+	for _, key := range args.Keys {
+		_, _, expires, exists, err := kv.store.GetWithMeta(key)
+		if err != nil {
+			continue
+		}
+		if !exists || !isExpired(expires, args.Cutoff) {
+			continue
+		}
+		if err := kv.store.Delete(key); err != nil {
+			continue
+		}
+		expired = append(expired, key)
+	}
+	if len(expired) > 0 {
+		kv.stats.RecordTTLExpired(int64(len(expired)))
+	}
+	return kvraftapi.ExpireReply{ExpiredKeys: expired, Err: kvraftapi.OK}
 }
 
 // ============================================================
@@ -259,16 +332,19 @@ func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) erro
 		reply.Err = kvraftapi.ErrWrongLeader
 		return nil
 	}
-	err, ret := kv.rsm.Submit(args)
+	err, ret := kv.rsm.SubmitLeaseRead(args)
 	if err != kvraftapi.OK {
 		reply.Err = err
+		kv.stats.RecordLeaseFallback()
 		return nil
 	}
 	getReply := ret.(kvraftapi.GetReply)
 	reply.Value = getReply.Value
 	reply.Version = getReply.Version
+	reply.Expires = getReply.Expires
 	reply.Err = getReply.Err
 	kv.stats.RecordRead()
+	kv.stats.RecordLeaseHit()
 	return nil
 }
 
@@ -326,6 +402,10 @@ func (kv *KVServer) OnOpComplete(req any, result any, index int64) {
 		kv.notifyDeleteEvent(t, result, watchMgr)
 	case kvraftapi.DeleteArgs:
 		kv.notifyDeleteEvent(&t, result, watchMgr)
+	case *kvraftapi.ExpireArgs:
+		kv.notifyExpireEvent(t, result, watchMgr)
+	case kvraftapi.ExpireArgs:
+		kv.notifyExpireEvent(&t, result, watchMgr)
 	}
 }
 
@@ -380,6 +460,19 @@ func (kv *KVServer) notifyDeleteEvent(delArgs *kvraftapi.DeleteArgs, result any,
 	}
 }
 
+func (kv *KVServer) notifyExpireEvent(_ *kvraftapi.ExpireArgs, result any, watchMgr *watch.Manager) {
+	expReply, ok := result.(kvraftapi.ExpireReply)
+	if !ok || expReply.Err != kvraftapi.OK {
+		return
+	}
+	for _, key := range expReply.ExpiredKeys {
+		err := watchMgr.Notify(key, "", "", 0, "EXPIRE")
+		if err == nil {
+			kv.stats.RecordWatchNotify()
+		}
+	}
+}
+
 // ============================================================
 // 生命周期管理
 // ============================================================
@@ -420,6 +513,9 @@ func (kv *KVServer) StatsSnapshot() ServerStats {
 		TotalReads:     atomic.LoadInt64(&kv.stats.TotalReads),
 		FailedRequests: atomic.LoadInt64(&kv.stats.FailedRequests),
 		WatchNotifies:  atomic.LoadInt64(&kv.stats.WatchNotifies),
+		LeaseHits:      atomic.LoadInt64(&kv.stats.LeaseHits),
+		LeaseFallbacks: atomic.LoadInt64(&kv.stats.LeaseFallbacks),
+		TTLExpiredOps:  atomic.LoadInt64(&kv.stats.TTLExpiredOps),
 	}
 }
 
@@ -445,6 +541,18 @@ func (s *ServerStats) RecordWatchNotify() {
 	atomic.AddInt64(&s.WatchNotifies, 1)
 }
 
+func (s *ServerStats) RecordLeaseHit() {
+	atomic.AddInt64(&s.LeaseHits, 1)
+}
+
+func (s *ServerStats) RecordLeaseFallback() {
+	atomic.AddInt64(&s.LeaseFallbacks, 1)
+}
+
+func (s *ServerStats) RecordTTLExpired(n int64) {
+	atomic.AddInt64(&s.TTLExpiredOps, n)
+}
+
 func (s *ServerStats) GetStats() (requests, writes, reads, failures int64) {
 	return atomic.LoadInt64(&s.TotalRequests),
 		atomic.LoadInt64(&s.TotalWrites),
@@ -462,6 +570,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	gob.Register(kvraftapi.GetArgs{})
 	gob.Register(kvraftapi.DeleteArgs{})
 	gob.Register(kvraftapi.ScanArgs{})
+	gob.Register(kvraftapi.ExpireArgs{})
 
 	store, err := storage.NewStore("badger-" + address)
 	if err != nil {
@@ -469,10 +578,12 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	}
 
 	kv := &KVServer{
-		me:      me,
-		address: address,
-		store:   store,
-		stats:   &ServerStats{},
+		me:       me,
+		address:  address,
+		store:    store,
+		stats:    &ServerStats{},
+		ttlEvery: 2 * time.Second,
+		ttlBatch: 128,
 	}
 
 	kv.rsm = MakeRSM(servers, me, persister, maxraftstate, kv)
@@ -505,6 +616,29 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 
 	// 对外业务接口迁移到 gRPC（Raft 复制仍使用 RPC）。
 	kv.grpcSrv, kv.grpcLn = startGRPCServer(kv, address)
+	go kv.ttlCleanupLoop()
 
 	return kv
+}
+
+func (kv *KVServer) ttlCleanupLoop() {
+	ticker := time.NewTicker(kv.ttlEvery)
+	defer ticker.Stop()
+	for !kv.killed() {
+		<-ticker.C
+		if kv.killed() {
+			return
+		}
+		_, isLeader := kv.rsm.Raft().GetState()
+		if !isLeader {
+			continue
+		}
+		now := time.Now().UnixNano()
+		keys, err := kv.store.GetExpiredKeys(now, kv.ttlBatch)
+		if err != nil || len(keys) == 0 {
+			continue
+		}
+		args := &kvraftapi.ExpireArgs{Keys: keys, Cutoff: now}
+		_, _ = kv.rsm.Submit(args)
+	}
 }
