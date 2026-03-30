@@ -72,6 +72,20 @@ fi
 
 echo ""
 echo "=== 2/4 Stage source files ==="
+
+stage_path() {
+    local path="$1"
+    if [[ -e "${path}" ]]; then
+        git add -A -- "${path}"
+        return
+    fi
+
+    # Stage deletions for tracked files/dirs that were removed locally.
+    if git ls-files -- "${path}" "${path}/**" | grep -q .; then
+        git add -A -- "${path}"
+    fi
+}
+
 PATHS=(
     .gitignore
     README.md
@@ -86,28 +100,28 @@ PATHS=(
     prometheus.yml
     api
     cmd
-    docs
     deployments
     examples
     pkg
     scripts
+    benchmarks
+    raft
+    raftapi
+    raftkv
+    rsm
+    sharding
+    storage
+    wal
+    watch
 )
 
 for path in "${PATHS[@]}"; do
-    if [[ -e "${path}" ]]; then
-        git add "${path}"
-    fi
+    stage_path "${path}"
 done
 
-if [[ -f "benchmarks/benchmark.go" ]]; then
-    git add "benchmarks/benchmark.go"
-fi
-if [[ -f "benchmarks/run.sh" ]]; then
-    git add "benchmarks/run.sh"
-fi
-if [[ -f "cmd/benchmarks/benchmark.go" ]]; then
-    git add "cmd/benchmarks/benchmark.go"
-fi
+stage_path "benchmarks/benchmark.go"
+stage_path "benchmarks/run.sh"
+stage_path "cmd/benchmarks/benchmark.go"
 
 # Avoid committing local benchmark/runtime artifacts.
 git reset -q -- benchmarks/benchmark cmd/benchmarks/benchmark data 2>/dev/null || true
