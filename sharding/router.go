@@ -56,6 +56,9 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 1200 * time.Millisecond
 	}
+	if cfg.PreferredReplicas <= 0 {
+		cfg.PreferredReplicas = 3
+	}
 	if len(cfg.Groups) == 0 {
 		return nil, fmt.Errorf("sharding config has no groups")
 	}
@@ -201,6 +204,14 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 			candidates = append(candidates, addr)
 			seen[addr] = true
 		}
+	}
+
+	maxCandidates := r.config.PreferredReplicas
+	if maxCandidates <= 0 || maxCandidates > len(candidates) {
+		maxCandidates = len(candidates)
+	}
+	if maxCandidates < len(candidates) {
+		candidates = candidates[:maxCandidates]
 	}
 
 	return candidates
@@ -398,6 +409,9 @@ func (r *ShardRouter) ScanRoute(ctx context.Context, prefix string, limit int32)
 	gids := r.GroupIDs()
 	if len(gids) == 0 {
 		return nil, fmt.Errorf("no groups configured")
+	}
+	if len(gids) == 1 {
+		return r.ScanGroup(ctx, gids[0], prefix, limit)
 	}
 
 	all := make([]*pb.KeyValue, 0)

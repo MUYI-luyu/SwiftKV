@@ -25,6 +25,14 @@ type Store struct {
 	dbPath string
 }
 
+type PutCASStatus int
+
+const (
+	PutCASOK PutCASStatus = iota
+	PutCASNoKey
+	PutCASVersionMismatch
+)
+
 func badgerOptions(dbPath string) badger.Options {
 	return badger.DefaultOptions(dbPath).WithLoggingLevel(badger.WARNING)
 }
@@ -118,6 +126,71 @@ func (s *Store) PutWithTTL(key, value string, version uint64, expires int64) err
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(key), data)
 	})
+}
+
+// PutCASWithTTL performs version-check and write in a single transaction.
+func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires int64) (oldValue string, status PutCASStatus, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status = PutCASOK
+	err = s.db.Update(func(txn *badger.Txn) error {
+		item, getErr := txn.Get([]byte(key))
+		if getErr == badger.ErrKeyNotFound {
+			if expectedVersion != 0 {
+				status = PutCASNoKey
+				return nil
+			}
+			entry := kvEntry{Value: value, Version: 1, Expires: expires}
+			data, marshalErr := json.Marshal(entry)
+			if marshalErr != nil {
+				return fmt.Errorf("序列化失败: %w", marshalErr)
+			}
+			return txn.Set([]byte(key), data)
+		}
+		if getErr != nil {
+			return getErr
+		}
+
+		raw, copyErr := item.ValueCopy(nil)
+		if copyErr != nil {
+			return copyErr
+		}
+		var cur kvEntry
+		if unmarshalErr := json.Unmarshal(raw, &cur); unmarshalErr != nil {
+			return unmarshalErr
+		}
+
+		now := time.Now().UnixNano()
+		exists := !(cur.Expires > 0 && cur.Expires <= now)
+		if !exists {
+			if expectedVersion != 0 {
+				status = PutCASNoKey
+				return nil
+			}
+			entry := kvEntry{Value: value, Version: 1, Expires: expires}
+			data, marshalErr := json.Marshal(entry)
+			if marshalErr != nil {
+				return fmt.Errorf("序列化失败: %w", marshalErr)
+			}
+			return txn.Set([]byte(key), data)
+		}
+
+		if cur.Version != expectedVersion {
+			status = PutCASVersionMismatch
+			return nil
+		}
+
+		oldValue = cur.Value
+		entry := kvEntry{Value: value, Version: cur.Version + 1, Expires: expires}
+		data, marshalErr := json.Marshal(entry)
+		if marshalErr != nil {
+			return fmt.Errorf("序列化失败: %w", marshalErr)
+		}
+		return txn.Set([]byte(key), data)
+	})
+
+	return oldValue, status, err
 }
 
 // GetExpiredKeys returns keys whose expiry is <= cutoff.

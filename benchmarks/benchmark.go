@@ -5,12 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	kvraftapi "kvraft/raftkv/rpc"
 	"kvraft/rsm"
+	"kvraft/sharding"
 )
 
 // 注意：SimplePersister 已移至 rsm/persister.go (FilePersister)
@@ -18,12 +22,14 @@ import (
 
 // BenchmarkConfig 描述压测配置。
 type BenchmarkConfig struct {
-	Servers   int           // 集群节点数
-	Clients   int           // 并发客户端数
-	Requests  int           // 每个客户端的请求数
-	ReadRatio float64       // 读请求比例 (0.0 - 1.0)
-	Keys      int           // key 空间大小
-	Duration  time.Duration // 压测阶段最长时长
+	Servers      int           // 集群节点数
+	Clients      int           // 并发客户端数
+	Requests     int           // 每个客户端的请求数
+	ReadRatio    float64       // 读请求比例 (0.0 - 1.0)
+	Keys         int           // key 空间大小
+	Duration     time.Duration // 压测阶段最长时长
+	MaxRaftState int           // 快照阈值，-1 表示关闭
+	Sharded      bool          // 是否使用 MakeShardedClerk
 }
 
 // BenchmarkResult 汇总压测结果。
@@ -47,6 +53,42 @@ func cleanBenchmarkDataDirs(servers []string) {
 	}
 }
 
+func raftToGRPCAddr(raftAddr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(raftAddr))
+	if err != nil {
+		return raftAddr
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return raftAddr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p+1000))
+}
+
+func makeBenchmarkClerk(servers []string, shardedMode bool) (*rsm.Clerk, error) {
+	if !shardedMode {
+		return rsm.MakeClerk(servers), nil
+	}
+
+	replicas := make([]string, 0, len(servers))
+	for _, s := range servers {
+		replicas = append(replicas, raftToGRPCAddr(s))
+	}
+	cfg := sharding.ShardingConfig{
+		Groups: []sharding.RaftGroupConfig{{
+			GroupID:   1,
+			Replicas:  replicas,
+			LeaderIdx: 0,
+		}},
+		VirtualNodeCount:  150,
+		PreferredReplicas: 3,
+		ConnectTimeout:    2 * time.Second,
+		RequestTimeout:    1200 * time.Millisecond,
+	}
+
+	return rsm.MakeShardedClerk(cfg)
+}
+
 // RunRealBenchmark 启动一个实际的 KVraft 集群进行压测
 func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult, error) {
 	if cfg.Servers <= 0 {
@@ -66,6 +108,9 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	}
 	if cfg.Duration <= 0 {
 		cfg.Duration = 30 * time.Second
+	}
+	if cfg.MaxRaftState == 0 {
+		cfg.MaxRaftState = -1
 	}
 
 	// 1. 构建服务器地址列表
@@ -87,7 +132,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			return BenchmarkResult{}, fmt.Errorf("create persister for server %d: %w", i, err)
 		}
 		persisters[i] = p
-		kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], -1, servers[i])
+		kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], cfg.MaxRaftState, servers[i])
 	}
 	fmt.Printf(" OK (%d 个节点)\n", cfg.Servers)
 
@@ -121,7 +166,13 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		initWg.Add(1)
 		go func() {
 			defer initWg.Done()
-			c := rsm.MakeClerk(servers)
+			c, clerkErr := makeBenchmarkClerk(servers, cfg.Sharded)
+			if clerkErr != nil {
+				initMu.Lock()
+				initFail += int64(cfg.Keys / initWorkers)
+				initMu.Unlock()
+				return
+			}
 			defer c.Close()
 
 			var localOK int64
@@ -175,7 +226,11 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	var latencySamples int64
 	workerClerks := make([]*rsm.Clerk, cfg.Clients)
 	for i := 0; i < cfg.Clients; i++ {
-		workerClerks[i] = rsm.MakeClerk(servers)
+		c, err := makeBenchmarkClerk(servers, cfg.Sharded)
+		if err != nil {
+			return BenchmarkResult{}, fmt.Errorf("create worker clerk %d: %w", i, err)
+		}
+		workerClerks[i] = c
 	}
 
 	// 压测阶段的时间预算应只受 cfg.Duration 控制，避免外层 deadline 在预热阶段耗尽。
@@ -295,6 +350,22 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	}
 
 	// 7. 清理资源
+	for i, kv := range kvServers {
+		if kv == nil {
+			continue
+		}
+		s := kv.StatsSnapshot()
+		fmt.Printf("server[%d] stats: req=%d read=%d write=%d lease_hit=%d lease_fallback=%d fail=%d\n",
+			i, s.TotalRequests, s.TotalReads, s.TotalWrites, s.LeaseHits, s.LeaseFallbacks, s.FailedRequests)
+		leaseStatsEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "1") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "true") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "yes") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "on")
+		if leaseStatsEnabled && s.TotalReads > 0 && s.LeaseHits+s.LeaseFallbacks == 0 {
+			fmt.Printf("server[%d] warning: read>0 but lease counters are 0; please rebuild benchmark/server binaries or use go run to ensure latest code.\n", i)
+		}
+	}
+
 	fmt.Print("清理资源...")
 	for _, c := range workerClerks {
 		if c != nil {
@@ -316,15 +387,19 @@ func main() {
 	readRatio := flag.Float64("read-ratio", 0.7, "读请求比例 (0.0-1.0)")
 	keys := flag.Int("keys", 10000, "key 空间大小")
 	duration := flag.Duration("duration", 30*time.Second, "压测最长时长")
+	maxRaftState := flag.Int("maxraftstate", -1, "快照阈值字节数，-1 表示关闭快照")
+	sharded := flag.Bool("sharded", true, "是否使用 MakeShardedClerk 路由模式")
 	flag.Parse()
 
 	cfg := BenchmarkConfig{
-		Servers:   *servers,
-		Clients:   *clients,
-		Requests:  *requests,
-		ReadRatio: *readRatio,
-		Keys:      *keys,
-		Duration:  *duration,
+		Servers:      *servers,
+		Clients:      *clients,
+		Requests:     *requests,
+		ReadRatio:    *readRatio,
+		Keys:         *keys,
+		Duration:     *duration,
+		MaxRaftState: *maxRaftState,
+		Sharded:      *sharded,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -337,6 +412,8 @@ func main() {
 	fmt.Printf("配置: %d 个节点, %d 个客户端, 每个客户端 %d 个请求\n", cfg.Servers, cfg.Clients, cfg.Requests)
 	fmt.Printf("读写比: %.1f%% 读 / %.1f%% 写\n", cfg.ReadRatio*100, (1-cfg.ReadRatio)*100)
 	fmt.Printf("key 空间: %d\n", cfg.Keys)
+	fmt.Printf("maxraftstate: %d\n", cfg.MaxRaftState)
+	fmt.Printf("clerk mode: %s\n", map[bool]string{true: "sharded", false: "classic"}[cfg.Sharded])
 	fmt.Println()
 
 	startTime := time.Now()

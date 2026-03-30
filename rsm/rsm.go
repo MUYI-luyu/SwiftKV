@@ -189,18 +189,27 @@ func (rsm *RSM) EnableLeaseRead(enable bool) {
 
 // SubmitLeaseRead tries local lease read first, then falls back to consensus path.
 func (rsm *RSM) SubmitLeaseRead(req any) (kvraftapi.Err, any) {
+	err, ret, _ := rsm.SubmitLeaseReadWithMode(req)
+	return err, ret
+}
+
+// SubmitLeaseReadWithMode returns whether the request was served via local lease read.
+func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kvraftapi.Err, any, bool) {
 	if !rsm.leaseRead.Load() {
-		return rsm.Submit(req)
+		err, ret := rsm.Submit(req)
+		return err, ret, false
 	}
 	rfImpl, ok := rsm.rf.(*raft.Raft)
 	if !ok {
-		return rsm.Submit(req)
+		err, ret := rsm.Submit(req)
+		return err, ret, false
 	}
 	if rfImpl.IsLeaderWithLease() {
 		result := rsm.sm.DoOp(req)
-		return kvraftapi.OK, result
+		return kvraftapi.OK, result, true
 	}
-	return rsm.Submit(req)
+	err, ret := rsm.Submit(req)
+	return err, ret, false
 }
 
 func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {

@@ -3,6 +3,7 @@ package rsm
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,6 +32,18 @@ type Clerk struct {
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
 	clients map[string]pb.KVServiceClient
+}
+
+func rpcTimeout(defaultMs int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("KV_RPC_TIMEOUT_MS"))
+	if raw == "" {
+		return time.Duration(defaultMs) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return time.Duration(defaultMs) * time.Millisecond
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // WatchSubscription 表示一个可取消的 Watch 订阅。
@@ -144,17 +157,6 @@ func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 	ck.conns[addr] = conn
 	ck.clients[addr] = client
 	return client, nil
-}
-
-func (ck *Clerk) preferredIndex(key string) int {
-	if len(ck.grpcServers) == 0 || ck.hasher == nil {
-		return 0
-	}
-	node := ck.hasher.GetNode(key)
-	if idx, ok := ck.serverToIdx[node]; ok {
-		return idx
-	}
-	return ck.leader
 }
 
 func (ck *Clerk) preferredCandidates(key string) []int {
@@ -283,7 +285,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(250))
 			resp, rpcErr := client.Get(ctx, &pb.GetRequest{Key: args.Key})
 			cancel()
 
@@ -372,7 +374,7 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(250))
 			resp, rpcErr := client.Put(ctx, &pb.PutRequest{Key: args.Key, Value: args.Value, Version: int64(args.Version)})
 			cancel()
 			if rpcErr == nil && resp != nil {
@@ -447,7 +449,7 @@ func (ck *Clerk) Delete(key string) kvraftapi.Err {
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(250))
 			resp, rpcErr := client.Delete(ctx, &pb.DeleteRequest{Key: key})
 			cancel()
 			if rpcErr == nil && resp != nil {
@@ -498,7 +500,7 @@ func (ck *Clerk) Scan(prefix string, limit int32) ([]*pb.KeyValue, kvraftapi.Err
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(300))
 			resp, rpcErr := client.Scan(ctx, &pb.ScanRequest{Prefix: prefix, Limit: limit})
 			cancel()
 			if rpcErr == nil && resp != nil {

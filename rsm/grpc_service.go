@@ -45,17 +45,30 @@ func errReply(e kvraftapi.Err) string {
 
 func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	if s.kv.killed() {
+		s.kv.stats.RecordFailure()
 		return &pb.GetResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.SubmitLeaseRead(&kvraftapi.GetArgs{Key: req.GetKey()})
+	err, ret, leaseHit := s.kv.rsm.SubmitLeaseReadWithMode(&kvraftapi.GetArgs{Key: req.GetKey()})
 	if err != kvraftapi.OK {
+		s.kv.stats.RecordFailure()
+		s.kv.stats.RecordLeaseFallback()
 		return &pb.GetResponse{Error: errReply(err)}, nil
 	}
 
 	reply, ok := ret.(kvraftapi.GetReply)
 	if !ok {
+		s.kv.stats.RecordFailure()
 		return &pb.GetResponse{Error: "ErrInternal"}, nil
+	}
+
+	s.kv.stats.RecordRead()
+	if s.kv.leaseStatEnabled {
+		if leaseHit {
+			s.kv.stats.RecordLeaseHit()
+		} else {
+			s.kv.stats.RecordLeaseFallback()
+		}
 	}
 
 	return &pb.GetResponse{

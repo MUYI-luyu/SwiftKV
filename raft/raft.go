@@ -190,8 +190,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedTerm)
 
 	data := w.Bytes()
-	// rf.persister.Save(data, nil)
-	rf.persister.Save(data, rf.persister.ReadSnapshot())
+	// Regular persist does not need to rewrite snapshot each time.
+	rf.persister.Save(data, nil)
 }
 
 // 恢复先前持久化的状态。

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -46,18 +47,24 @@ type OperationInfo struct {
 }
 
 type KVServer struct {
-	me       int
-	dead     int32
-	address  string
-	rsm      *RSM
-	mu       sync.RWMutex
-	store    *storage.Store
-	stats    *ServerStats
-	ttlEvery time.Duration
-	ttlBatch int
-	rpcLn    net.Listener
-	grpcLn   net.Listener
-	grpcSrv  *grpc.Server
+	me               int
+	dead             int32
+	address          string
+	rsm              *RSM
+	mu               sync.RWMutex
+	store            *storage.Store
+	stats            *ServerStats
+	leaseStatEnabled bool
+	ttlEvery         time.Duration
+	ttlBatch         int
+	rpcLn            net.Listener
+	grpcLn           net.Listener
+	grpcSrv          *grpc.Server
+}
+
+func leaseStatsEnabledFromEnv() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("KV_LEASE_STATS")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 type ServerStats struct {
@@ -76,9 +83,6 @@ type ServerStats struct {
 // ============================================================
 
 func (kv *KVServer) DoOp(req any) any {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	switch t := req.(type) {
 	case *kvraftapi.GetArgs:
 		return kv.doGet(t)
@@ -143,50 +147,30 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	// 获取当前值，用于Watch事件
 	now := time.Now().UnixNano()
-	oldValue, version, oldExpires, exists, err := kv.store.GetWithMeta(args.Key)
+	newExpires := absoluteExpiryFromTTL(args.TTL, now)
+
+	oldValue, status, err := kv.store.PutCASWithTTL(args.Key, args.Value, uint64(args.Version), newExpires)
 	if err != nil {
-		log.Printf("[KVServer-%d] Get error during Put: %v", kv.me, err)
+		log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
 		kv.stats.RecordFailure()
 		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 	}
-	if exists && isExpired(oldExpires, now) {
-		exists = false
-		oldValue = ""
-		version = 0
-	}
-	newExpires := absoluteExpiryFromTTL(args.TTL, now)
 
-	if exists {
-		if kvraftapi.Tversion(version) == args.Version {
-			newVersion := version + 1
-			if err := kv.store.PutWithTTL(args.Key, args.Value, newVersion, newExpires); err != nil {
-				log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
-				kv.stats.RecordFailure()
-				return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
-			}
-			kv.stats.RecordWrite()
-			// 返回修改前的值
-			return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: oldValue}
-		}
+	switch status {
+	case storage.PutCASOK:
+		kv.stats.RecordWrite()
+		return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: oldValue}
+	case storage.PutCASVersionMismatch:
 		kv.stats.RecordFailure()
 		return kvraftapi.PutReply{Err: kvraftapi.ErrVersion}
+	case storage.PutCASNoKey:
+		kv.stats.RecordFailure()
+		return kvraftapi.PutReply{Err: kvraftapi.ErrNoKey}
+	default:
+		kv.stats.RecordFailure()
+		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 	}
-
-	if args.Version == 0 {
-		if err := kv.store.PutWithTTL(args.Key, args.Value, 1, newExpires); err != nil {
-			log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
-			kv.stats.RecordFailure()
-			return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
-		}
-		kv.stats.RecordWrite()
-		// 新键，OldValue为空
-		return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: ""}
-	}
-
-	kv.stats.RecordFailure()
-	return kvraftapi.PutReply{Err: kvraftapi.ErrNoKey}
 }
 
 func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
@@ -332,7 +316,7 @@ func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) erro
 		reply.Err = kvraftapi.ErrWrongLeader
 		return nil
 	}
-	err, ret := kv.rsm.SubmitLeaseRead(args)
+	err, ret, leaseHit := kv.rsm.SubmitLeaseReadWithMode(args)
 	if err != kvraftapi.OK {
 		reply.Err = err
 		kv.stats.RecordLeaseFallback()
@@ -344,7 +328,13 @@ func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) erro
 	reply.Expires = getReply.Expires
 	reply.Err = getReply.Err
 	kv.stats.RecordRead()
-	kv.stats.RecordLeaseHit()
+	if kv.leaseStatEnabled {
+		if leaseHit {
+			kv.stats.RecordLeaseHit()
+		} else {
+			kv.stats.RecordLeaseFallback()
+		}
+	}
 	return nil
 }
 
@@ -578,12 +568,13 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	}
 
 	kv := &KVServer{
-		me:       me,
-		address:  address,
-		store:    store,
-		stats:    &ServerStats{},
-		ttlEvery: 2 * time.Second,
-		ttlBatch: 128,
+		me:               me,
+		address:          address,
+		store:            store,
+		stats:            &ServerStats{},
+		leaseStatEnabled: leaseStatsEnabledFromEnv(),
+		ttlEvery:         2 * time.Second,
+		ttlBatch:         128,
 	}
 
 	kv.rsm = MakeRSM(servers, me, persister, maxraftstate, kv)
