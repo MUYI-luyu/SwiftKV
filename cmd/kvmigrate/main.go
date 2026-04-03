@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"kvraft/pkg/sharding"
@@ -23,6 +25,27 @@ type jsonShardingConfig struct {
 	ConnectTimeoutMS  int         `json:"connect_timeout_ms"`
 	RequestTimeoutMS  int         `json:"request_timeout_ms"`
 	PreferredReplicas int         `json:"preferred_replicas"`
+}
+
+func loadRuntimeMetadata() map[string]string {
+	meta := map[string]string{}
+	path := filepath.Join("data", "cluster", "runtime.env")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return meta
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		meta[strings.TrimSpace(line[:idx])] = strings.TrimSpace(line[idx+1:])
+	}
+	return meta
 }
 
 func loadConfig(path string) (sharding.ShardingConfig, error) {
@@ -68,10 +91,27 @@ func main() {
 	timeoutSec := flag.Int("timeout-sec", 30, "migration timeout in seconds")
 
 	flag.Parse()
+	meta := loadRuntimeMetadata()
+
+	if strings.TrimSpace(*sourceCfgPath) == "" {
+		if p := strings.TrimSpace(meta["SHARDING_CONFIG"]); p != "" {
+			*sourceCfgPath = p
+		}
+	}
+	if strings.TrimSpace(*targetCfgPath) == "" {
+		if p := strings.TrimSpace(meta["SHARDING_NEXT_CONFIG"]); p != "" {
+			*targetCfgPath = p
+		}
+	}
+	if strings.TrimSpace(*targetCfgPath) == "" && strings.TrimSpace(*sourceCfgPath) != "" {
+		*targetCfgPath = *sourceCfgPath
+	}
 
 	if *sourceCfgPath == "" || *targetCfgPath == "" {
 		fmt.Println("usage:")
 		fmt.Println("  go run ./cmd/kvmigrate -source-config ./source.json -target-config ./target.json [-prefix p] [-limit n] [--dry-run] [--delete-source]")
+		fmt.Println("hint:")
+		fmt.Println("  直接执行时会优先读取 data/cluster/runtime.env 中的 SHARDING_CONFIG / SHARDING_NEXT_CONFIG")
 		os.Exit(2)
 	}
 
@@ -108,6 +148,10 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build migration plan failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *sourceCfgPath == *targetCfgPath {
+		fmt.Println("提示: source 和 target 配置相同，本次迁移计划通常为空（用于连通性与流程验证）。")
 	}
 
 	fmt.Printf("plan size: %d\n", len(plan))

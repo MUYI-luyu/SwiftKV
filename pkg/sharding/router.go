@@ -47,15 +47,19 @@ type WatchEventHandler func(groupID int, event *pb.WatchEvent)
 
 // NewShardRouter 创建并初始化分片路由器。
 func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
+	// 每个物理分片在哈希环上生成的“影子”数量
 	if cfg.VirtualNodeCount <= 0 {
 		cfg.VirtualNodeCount = 150
 	}
+	// 限制底层 TCP/gRPC 建立连接的最长时间
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 2 * time.Second
 	}
+	// 规定单次业务请求（如 Get/Put）的等待上限
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 1200 * time.Millisecond
 	}
+	// 每个物理分片在哈希环上生成的“影子”数量
 	if cfg.PreferredReplicas <= 0 {
 		cfg.PreferredReplicas = 3
 	}
@@ -66,12 +70,13 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 	r := &ShardRouter{
 		config:       cfg,
 		hashRing:     NewConsistentHash(cfg.VirtualNodeCount),
-		groupConns:   make(map[int]map[string]*grpc.ClientConn),
-		groupClients: make(map[int]map[string]pb.KVServiceClient),
-		groupsByID:   make(map[int]RaftGroupConfig, len(cfg.Groups)),
-		leaderCache:  make(map[int]string),
+		groupConns:   make(map[int]map[string]*grpc.ClientConn),      // 物理连接池
+		groupClients: make(map[int]map[string]pb.KVServiceClient),    // 业务逻辑接口池
+		groupsByID:   make(map[int]RaftGroupConfig, len(cfg.Groups)), // 配置查找表
+		leaderCache:  make(map[int]string),                           // leader状态缓存表
 	}
 
+	// 构建分片映射
 	for _, g := range cfg.Groups {
 		if g.GroupID <= 0 {
 			return nil, fmt.Errorf("invalid group id %d", g.GroupID)
@@ -86,6 +91,7 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 		r.hashRing.AddNode(fmt.Sprintf("group-%d", g.GroupID))
 	}
 
+	// 连接初始化
 	if err := r.initConnections(); err != nil {
 		r.Close()
 		return nil, err
@@ -97,6 +103,7 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 func (r *ShardRouter) initConnections() error {
 	for _, g := range r.config.Groups {
 		replicas := append([]string(nil), g.Replicas...)
+		// 为 g.GroupID 初始化专属的连接池ID
 		r.groupConns[g.GroupID] = make(map[string]*grpc.ClientConn, len(replicas))
 		r.groupClients[g.GroupID] = make(map[string]pb.KVServiceClient, len(replicas))
 
@@ -105,8 +112,8 @@ func (r *ShardRouter) initConnections() error {
 			conn, err := grpc.DialContext(
 				dialCtx,
 				replica,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithBlock(),
+				grpc.WithTransportCredentials(insecure.NewCredentials()), // 不使用 SSL/TLS 加密
+				grpc.WithBlock(), // 阻塞等待直到连接真正 Ready
 			)
 			cancel()
 			if err != nil {
@@ -186,8 +193,8 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 		return nil
 	}
 
-	seen := make(map[string]bool, len(g.Replicas))
-	candidates := make([]string, 0, len(g.Replicas))
+	seen := make(map[string]bool, len(g.Replicas))   // 地址去重表
+	candidates := make([]string, 0, len(g.Replicas)) // 候选地址切片(作为函数输出)
 
 	if leader, ok := r.leaderCache[gid]; ok && leader != "" {
 		if _, exists := r.groupClients[gid][leader]; exists {
@@ -196,6 +203,7 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 		}
 	}
 
+	// 选取可用副本
 	for _, addr := range g.Replicas {
 		if seen[addr] {
 			continue

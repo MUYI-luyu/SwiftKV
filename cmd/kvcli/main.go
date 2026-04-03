@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,29 @@ type jsonShardingConfig struct {
 	ConnectTimeoutMS  int         `json:"connect_timeout_ms"`
 	RequestTimeoutMS  int         `json:"request_timeout_ms"`
 	PreferredReplicas int         `json:"preferred_replicas"`
+}
+
+func loadRuntimeMetadata() map[string]string {
+	meta := map[string]string{}
+	path := filepath.Join("data", "cluster", "runtime.env")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return meta
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		meta[key] = val
+	}
+	return meta
 }
 
 func loadShardingConfig(path string) (sharding.ShardingConfig, error) {
@@ -88,15 +112,34 @@ func parseLimit(raw string) (int32, error) {
 }
 
 func main() {
-	serversFlag := flag.String("servers", "127.0.0.1:5001,127.0.0.1:5002,127.0.0.1:5003", "comma-separated rpc server addresses for single-raft mode")
+	serversFlag := flag.String("servers", "", "comma-separated rpc server addresses for single-raft mode")
 	shardingConfig := flag.String("sharding-config", "", "path to sharding config json for sharded mode")
 	flag.Parse()
 
 	var ck *rsm.Clerk
 	var err error
+	meta := loadRuntimeMetadata()
 	mode := "single-raft"
-	if *shardingConfig != "" {
-		cfg, cfgErr := loadShardingConfig(*shardingConfig)
+	resolvedShardingCfg := strings.TrimSpace(*shardingConfig)
+	if resolvedShardingCfg == "" {
+		if p := strings.TrimSpace(meta["SHARDING_CONFIG"]); p != "" {
+			if _, statErr := os.Stat(p); statErr == nil {
+				resolvedShardingCfg = p
+			}
+		}
+	}
+
+	resolvedServers := strings.TrimSpace(*serversFlag)
+	if resolvedServers == "" {
+		if s := strings.TrimSpace(meta["RAFT_SERVERS"]); s != "" {
+			resolvedServers = s
+		} else {
+			resolvedServers = "127.0.0.1:15000,127.0.0.1:15001,127.0.0.1:15002"
+		}
+	}
+
+	if resolvedShardingCfg != "" {
+		cfg, cfgErr := loadShardingConfig(resolvedShardingCfg)
 		if cfgErr != nil {
 			fmt.Fprintf(os.Stderr, "load sharding config failed: %v\n", cfgErr)
 			os.Exit(1)
@@ -104,7 +147,7 @@ func main() {
 		ck, err = rsm.MakeShardedClerk(cfg)
 		mode = "sharded"
 	} else {
-		servers := strings.Split(*serversFlag, ",")
+		servers := strings.Split(resolvedServers, ",")
 		for i := range servers {
 			servers[i] = strings.TrimSpace(servers[i])
 		}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -25,6 +26,7 @@ import (
 type BenchmarkConfig struct {
 	Servers          int           // 集群节点数
 	ServerAddrs      []string      // 外部集群地址列表（非空时不在进程内拉起集群）
+	ShardingConfig   string        // 分片配置文件路径（sharded=true 时优先生效）
 	Clients          int           // 并发客户端数
 	Requests         int           // 每个客户端的请求数
 	ReadRatio        float64       // 读请求比例 (0.0 - 1.0)
@@ -73,9 +75,55 @@ func raftToGRPCAddr(raftAddr string) string {
 	return net.JoinHostPort(host, strconv.Itoa(p+1000))
 }
 
-func makeBenchmarkClerk(servers []string, shardedMode bool) (*rsm.Clerk, error) {
+func loadShardingConfig(path string) (*sharding.ShardingConfig, error) {
+	type groupJSON struct {
+		GroupID   int      `json:"group_id"`
+		Replicas  []string `json:"replicas"`
+		LeaderIdx int      `json:"leader_idx"`
+	}
+	type cfgJSON struct {
+		Groups            []groupJSON `json:"groups"`
+		VirtualNodeCount  int         `json:"virtual_node_count"`
+		ConnectTimeoutMS  int         `json:"connect_timeout_ms"`
+		RequestTimeoutMS  int         `json:"request_timeout_ms"`
+		PreferredReplicas int         `json:"preferred_replicas"`
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read sharding config failed: %w", err)
+	}
+
+	var parsed cfgJSON
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("parse sharding config failed: %w", err)
+	}
+
+	groups := make([]sharding.RaftGroupConfig, 0, len(parsed.Groups))
+	for _, g := range parsed.Groups {
+		groups = append(groups, sharding.RaftGroupConfig{
+			GroupID:   g.GroupID,
+			Replicas:  append([]string(nil), g.Replicas...),
+			LeaderIdx: g.LeaderIdx,
+		})
+	}
+
+	cfg := &sharding.ShardingConfig{
+		Groups:            groups,
+		VirtualNodeCount:  parsed.VirtualNodeCount,
+		PreferredReplicas: parsed.PreferredReplicas,
+		ConnectTimeout:    time.Duration(parsed.ConnectTimeoutMS) * time.Millisecond,
+		RequestTimeout:    time.Duration(parsed.RequestTimeoutMS) * time.Millisecond,
+	}
+	return cfg, nil
+}
+
+func makeBenchmarkClerk(servers []string, shardedMode bool, shardingCfg *sharding.ShardingConfig) (*rsm.Clerk, error) {
 	if !shardedMode {
 		return rsm.MakeClerk(servers), nil
+	}
+	if shardingCfg != nil {
+		return rsm.MakeShardedClerk(*shardingCfg)
 	}
 
 	replicas := make([]string, 0, len(servers))
@@ -140,6 +188,14 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 	manageCluster := len(cfg.ServerAddrs) == 0
 	kvServers := make([]*rsm.KVServer, cfg.Servers)
+	var shardingCfg *sharding.ShardingConfig
+	if cfg.Sharded && strings.TrimSpace(cfg.ShardingConfig) != "" {
+		loadedCfg, err := loadShardingConfig(strings.TrimSpace(cfg.ShardingConfig))
+		if err != nil {
+			return BenchmarkResult{}, err
+		}
+		shardingCfg = loadedCfg
+	}
 
 	// 2. 启动集群（仅在内置模式）
 	if manageCluster {
@@ -174,7 +230,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	if initTarget == 0 {
 		fmt.Println(" SKIP (init-keys=0)")
 	} else if !manageCluster && cfg.SkipInitIfSeeded {
-		seedCheckClerk, err := makeBenchmarkClerk(servers, cfg.Sharded)
+		seedCheckClerk, err := makeBenchmarkClerk(servers, cfg.Sharded, shardingCfg)
 		if err == nil {
 			allSeeded := true
 			probe := initTarget
@@ -219,7 +275,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			initWg.Add(1)
 			go func() {
 				defer initWg.Done()
-				c, clerkErr := makeBenchmarkClerk(servers, cfg.Sharded)
+				c, clerkErr := makeBenchmarkClerk(servers, cfg.Sharded, shardingCfg)
 				if clerkErr != nil {
 					initMu.Lock()
 					initFail += int64(initTarget / initWorkers)
@@ -280,7 +336,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	var latencySamples int64
 	workerClerks := make([]*rsm.Clerk, cfg.Clients)
 	for i := 0; i < cfg.Clients; i++ {
-		c, err := makeBenchmarkClerk(servers, cfg.Sharded)
+		c, err := makeBenchmarkClerk(servers, cfg.Sharded, shardingCfg)
 		if err != nil {
 			return BenchmarkResult{}, fmt.Errorf("create worker clerk %d: %w", i, err)
 		}
@@ -443,6 +499,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 func main() {
 	servers := flag.Int("servers", 3, "KVraft 集群节点数")
 	serverAddrs := flag.String("server-addrs", "", "外部集群 rpc 地址列表，逗号分隔（设置后不会自动启动/关闭集群）")
+	shardingConfig := flag.String("sharding-config", "", "分片配置文件路径（sharded=true 时建议传入 data/cluster/sharding.json）")
 	clients := flag.Int("clients", 10, "并发客户端数")
 	requests := flag.Int("requests", 1000, "每个客户端的请求数")
 	readRatio := flag.Float64("read-ratio", 0.7, "读请求比例 (0.0-1.0)")
@@ -451,7 +508,7 @@ func main() {
 	skipInitIfSeeded := flag.Bool("skip-init-if-seeded", true, "外部集群下若已存在预热 key 则跳过预热")
 	duration := flag.Duration("duration", 30*time.Second, "压测最长时长")
 	maxRaftState := flag.Int("maxraftstate", -1, "快照阈值字节数，-1 表示关闭快照")
-	sharded := flag.Bool("sharded", true, "是否使用 MakeShardedClerk 路由模式")
+	sharded := flag.Bool("sharded", false, "是否使用 MakeShardedClerk 路由模式（单 Raft 组建议 false，多 group 分片建议 true）")
 	flag.Parse()
 
 	parsedAddrs := make([]string, 0)
@@ -467,6 +524,7 @@ func main() {
 	cfg := BenchmarkConfig{
 		Servers:          *servers,
 		ServerAddrs:      parsedAddrs,
+		ShardingConfig:   *shardingConfig,
 		Clients:          *clients,
 		Requests:         *requests,
 		ReadRatio:        *readRatio,
@@ -496,6 +554,9 @@ func main() {
 	fmt.Printf("预热 key: %d (skip-init-if-seeded=%t)\n", cfg.InitKeys, cfg.SkipInitIfSeeded)
 	fmt.Printf("maxraftstate: %d\n", cfg.MaxRaftState)
 	fmt.Printf("clerk mode: %s\n", map[bool]string{true: "sharded", false: "classic"}[cfg.Sharded])
+	if strings.TrimSpace(cfg.ShardingConfig) != "" {
+		fmt.Printf("sharding config: %s\n", cfg.ShardingConfig)
+	}
 	fmt.Println()
 
 	startTime := time.Now()

@@ -132,8 +132,8 @@ func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 	target := "passthrough:///" + addr
 	conn, err := grpc.NewClient(
 		target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		grpc.WithTransportCredentials(insecure.NewCredentials()), // 使用不加密的明文传输。
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{ // 配置保活参数。
 			Time:                2 * time.Minute,
 			Timeout:             3 * time.Second,
 			PermitWithoutStream: false,
@@ -159,20 +159,23 @@ func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 	return client, nil
 }
 
+// 为特定的 key 生成一个优先访问列表
 func (ck *Clerk) preferredCandidates(key string) []int {
 	if len(ck.grpcServers) == 0 || ck.hasher == nil {
 		return []int{0}
 	}
 
+	// 计算一致性哈希推荐节点
 	count := 3
 	if len(ck.grpcServers) < count {
 		count = len(ck.grpcServers)
 	}
 
-	nodes := ck.hasher.GetNodes(key, count)
-	seen := make(map[int]bool, len(ck.grpcServers))
-	idxs := make([]int, 0, len(ck.grpcServers))
+	nodes := ck.hasher.GetNodes(key, count)         // 哈希环推荐的节点地址切片
+	seen := make(map[int]bool, len(ck.grpcServers)) // 去重查重表
+	idxs := make([]int, 0, len(ck.grpcServers))     // 存储排序后的服务器下标，调用者会按这个顺序挨个尝试发请求。
 
+	// 将哈希环返回的字符串地址转回数字下标
 	for _, n := range nodes {
 		if idx, ok := ck.serverToIdx[n]; ok && !seen[idx] {
 			idxs = append(idxs, idx)
@@ -180,7 +183,7 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 		}
 	}
 
-	// 单 Raft 组场景下，优先走最近成功 leader，可显著减少 WrongLeader 往返。
+	// 单 Raft 组场景下，优先走最近成功 leader（把leader插入列表头部），可显著减少 WrongLeader 往返。
 	if ck.leader >= 0 && ck.leader < len(ck.grpcServers) {
 		if !seen[ck.leader] {
 			idxs = append([]int{ck.leader}, idxs...)
@@ -207,6 +210,7 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 	return idxs
 }
 
+// 解析报错信息中的 IP:Port
 func parseRedirectLeaderAddr(msg string) string {
 	re := regexp.MustCompile(`([a-zA-Z0-9._-]+:\d{2,5})`)
 	m := re.FindStringSubmatch(msg)
@@ -216,6 +220,7 @@ func parseRedirectLeaderAddr(msg string) string {
 	return m[0]
 }
 
+// 错误类型转换器
 func mapPBErr(errText string) kvraftapi.Err {
 	switch errText {
 	case string(kvraftapi.OK), "":

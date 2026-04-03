@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# One-shot environment bootstrap: dependencies, proto generation, and optional tests.
-# Example:
+# 一键初始化开发环境：下载依赖、生成 proto 代码、可选执行测试。
+# 示例：
 #   ./scripts/setup_env.sh
 #   ./scripts/setup_env.sh --skip-proto
 #   ./scripts/setup_env.sh --with-test
@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      echo "Unknown arg: $1"
+      echo "未知参数: $1"
       exit 1
       ;;
   esac
@@ -31,19 +31,19 @@ done
 
 cd "${ROOT_DIR}"
 
-echo "Downloading Go dependencies..."
+echo "下载 Go 依赖..."
 go mod download
 
-echo "Installing protoc Go plugins..."
+echo "安装 protoc Go 插件..."
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 
 if [[ "${SKIP_PROTO}" -eq 0 ]]; then
   if command -v protoc >/dev/null 2>&1; then
-    echo "Generating protobuf/grpc code..."
+    echo "生成 protobuf/grpc 代码..."
     bash ./api/pb/compile.sh
   else
-    echo "protoc not found. Install it first, then rerun: ./api/pb/compile.sh"
+    echo "未检测到 protoc，请先安装后执行: ./api/pb/compile.sh"
   fi
 fi
 
@@ -55,8 +55,8 @@ fi
 chmod +x ./scripts/*.sh
 
 if [[ "${WITH_TEST}" -eq 1 ]]; then
-  echo "Running full tests..."
+  echo "执行全量测试..."
   ./scripts/test-all.sh
 fi
 
-echo "Environment setup completed."
+echo "环境初始化完成。"
