@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="chore: sync project updates"
+COMMIT_MSG="optimization: add comments"
 RUN_TEST=1
 DRY_RUN=0
 

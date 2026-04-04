@@ -116,6 +116,7 @@ func toGRPCAddress(raftAddr string) string {
 	return fmt.Sprintf("%s:%d", parts[0], p+1000)
 }
 
+// 返回业务逻辑存根
 func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
@@ -129,7 +130,8 @@ func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 		}
 	}
 
-	target := "passthrough:///" + addr
+	// 若连接失效，新建 gRPC 连接与性能配置
+	target := "passthrough:///" + addr // 使用 passthrough 方案绕过复杂的负载均衡解析，直接连接 IP
 	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), // 使用不加密的明文传输。
@@ -267,6 +269,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 		return "", 0, errCode
 	}
 
+	// 不是分片模式或分片路由未启用，进入传统模式
 	args := kvraftapi.GetArgs{Key: key}
 	timeout := time.After(10 * time.Second)
 	attempts := 0
@@ -276,7 +279,6 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 		case <-timeout:
 			fmt.Println("\n⚠️  获取操作超时（10秒）")
 			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-			fmt.Println("  bash examples/start_cluster.sh")
 			return "", 0, kvraftapi.ErrWrongLeader
 		default:
 		}
@@ -324,7 +326,6 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 			if attempts > 100 {
 				fmt.Printf("\n⚠️  Get 已尝试 %d 次，仍无可用服务器\n", attempts)
 				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-				fmt.Println("  bash examples/start_cluster.sh")
 				return "", 0, kvraftapi.ErrWrongLeader
 			}
 		}
