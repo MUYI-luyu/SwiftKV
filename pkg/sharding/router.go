@@ -150,6 +150,7 @@ func (r *ShardRouter) Resolve(key string) int {
 	return gid
 }
 
+// 返回 key 对应的分组 ID。
 func (r *ShardRouter) groupForKey(key string) (int, error) {
 	gid := r.Resolve(key)
 	if gid < 0 {
