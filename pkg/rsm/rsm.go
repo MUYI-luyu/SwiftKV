@@ -194,15 +194,18 @@ func (rsm *RSM) SubmitLeaseRead(req any) (kvraftapi.Err, any) {
 
 // SubmitLeaseReadWithMode returns whether the request was served via local lease read.
 func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kvraftapi.Err, any, bool) {
+	// 检查是否开启租约功能
 	if !rsm.leaseRead.Load() {
 		err, ret := rsm.Submit(req)
 		return err, ret, false
 	}
+	// 转换为 Raft 实现类
 	rfImpl, ok := rsm.rf.(*raft.Raft)
 	if !ok {
 		err, ret := rsm.Submit(req)
 		return err, ret, false
 	}
+	// 在租约期内直接读取本地数据
 	if rfImpl.IsLeaderWithLease() {
 		result := rsm.sm.DoOp(req)
 		return kvraftapi.OK, result, true
@@ -377,10 +380,8 @@ func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
 
 	result := rsm.sm.DoOp(oper.Req)
 
-	// ============================================================
 	// 关键：在状态机应用操作后，立即调用监听器
 	// 这确保 Watch 事件的线性一致性（在 CommandValid 之后）
-	// ============================================================
 	rsm.mu.Lock()
 	listener := rsm.opListener
 	rsm.mu.Unlock()

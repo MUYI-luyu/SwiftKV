@@ -30,10 +30,7 @@ func absoluteExpiryFromTTL(ttlSeconds int64, now int64) int64 {
 	return now + ttlSeconds*int64(time.Second)
 }
 
-// ============================================================
 // KVServer - 高性能分布式键值存储服务器
-// 集成特性：BadgerDB 存储、Watch 实时推送、性能统计
-// ============================================================
 
 type OperationInfo struct {
 	Type       string
@@ -90,9 +87,7 @@ type ServerStats struct {
 	TTLExpiredOps  int64
 }
 
-// ============================================================
 // 核心业务逻辑 - Do Op (执行状态机操作)
-// ============================================================
 
 func (kv *KVServer) DoOp(req any) any {
 	switch t := req.(type) {
@@ -289,9 +284,7 @@ func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
 	return kvraftapi.ExpireReply{ExpiredKeys: expired, Err: kvraftapi.OK}
 }
 
-// ============================================================
 // 快照管理
-// ============================================================
 
 func (kv *KVServer) Snapshot() []byte {
 	kv.mu.RLock()
@@ -319,9 +312,7 @@ func (kv *KVServer) Restore(data []byte) {
 	}
 }
 
-// ============================================================
 // RPC Handlers - 兼容旧 RPC 接口
-// ============================================================
 
 func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) error {
 	if kv.killed() {
@@ -381,9 +372,7 @@ func (kv *KVServer) Delete(args *kvraftapi.DeleteArgs, reply *kvraftapi.DeleteRe
 	return nil
 }
 
-// ============================================================
 // Watch 集成 - 关键的事件推送链路
-// ============================================================
 
 func (kv *KVServer) OnOpComplete(req any, result any, index int64) {
 	if kv.killed() {
@@ -475,9 +464,7 @@ func (kv *KVServer) notifyExpireEvent(_ *kvraftapi.ExpireArgs, result any, watch
 	}
 }
 
-// ============================================================
 // 生命周期管理
-// ============================================================
 
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
@@ -521,9 +508,7 @@ func (kv *KVServer) StatsSnapshot() ServerStats {
 	}
 }
 
-// ============================================================
 // 统计方法
-// ============================================================
 
 func (s *ServerStats) RecordRead() {
 	atomic.AddInt64(&s.TotalRequests, 1)
@@ -562,9 +547,7 @@ func (s *ServerStats) GetStats() (requests, writes, reads, failures int64) {
 		atomic.LoadInt64(&s.FailedRequests)
 }
 
-// ============================================================
 // 服务器启动
-// ============================================================
 
 func StartKVServer(servers []string, gid int, me int, persister Persister, maxraftstate int, address string) *KVServer {
 	gob.Register(Op{})

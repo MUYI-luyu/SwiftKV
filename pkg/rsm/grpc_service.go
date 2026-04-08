@@ -24,6 +24,7 @@ type grpcKVService struct {
 	kv *KVServer
 }
 
+// 根据已有的 Raft RPC 地址，自动生成一个用于 gRPC 服务的监听地址
 func grpcAddrFromRPC(addr string) string {
 	if explicit := strings.TrimSpace(os.Getenv("GRPC_LISTEN")); explicit != "" {
 		return explicit
@@ -56,6 +57,7 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 		return &pb.GetResponse{Error: errReply(err)}, nil
 	}
 
+	// 判断 ret 是否为预期的 GetReply 类型
 	reply, ok := ret.(kvraftapi.GetReply)
 	if !ok {
 		s.kv.stats.RecordFailure()
