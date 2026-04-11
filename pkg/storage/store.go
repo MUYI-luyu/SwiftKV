@@ -272,6 +272,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("反序列化快照失败: %w", err)
 	}
 
+	// 创建临时库
 	ts := time.Now().UnixNano()
 	tmpPath := fmt.Sprintf("%s.restore.%d", s.dbPath, ts)
 	backupPath := fmt.Sprintf("%s.backup.%d", s.dbPath, ts)
@@ -285,6 +286,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("打开临时恢复数据库失败: %w", err)
 	}
 
+	// 遍历快照中的每一条数据，序列化后写入到 tmpDB 中
 	for key, entry := range snapshot {
 		entryCopy := entry
 		data, marshalErr := json.Marshal(entryCopy)
@@ -310,6 +312,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 关闭当前正在运行的旧数据库
 	if s.db != nil {
 		if err := s.db.Close(); err != nil {
 			_ = os.RemoveAll(tmpPath)
@@ -323,6 +326,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("清理旧备份目录失败: %w", err)
 	}
 
+	// 备份旧数据
 	if _, err := os.Stat(s.dbPath); err == nil {
 		if err := os.Rename(s.dbPath, backupPath); err != nil {
 			_ = os.RemoveAll(tmpPath)
@@ -330,6 +334,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		}
 	}
 
+	// 切换新库。将装满快照数据的 tmpPath 改名为正式的 dbPath
 	if err := os.Rename(tmpPath, s.dbPath); err != nil {
 		_ = os.Rename(backupPath, s.dbPath)
 		return fmt.Errorf("切换恢复数据库失败: %w", err)
@@ -338,7 +343,7 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 	newDB, err := openBadger(s.dbPath)
 	if err != nil {
 		_ = os.RemoveAll(s.dbPath)
-		_ = os.Rename(backupPath, s.dbPath)
+		_ = os.Rename(backupPath, s.dbPath) // 失败回滚
 		fallbackDB, fallbackErr := openBadger(s.dbPath)
 		if fallbackErr == nil {
 			s.db = fallbackDB

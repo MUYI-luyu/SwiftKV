@@ -127,6 +127,7 @@ func MakeRSM(
 	}
 	rsm.shutdown.Store(false)
 	rsm.leaseRead.Store(true)
+	// 根据当前节点 ID 生成预写日志（WAL）的绝对路径
 	walPath := filepath.Join(runtimeDataRoot(), "wal", fmt.Sprintf("rsm-node-%d.log", me))
 	walLogger, err := wal.NewLogger(walPath, true)
 	if err != nil {

@@ -24,7 +24,7 @@
 ### 1. 环境要求
 
 - Linux 或 macOS
-- Go 1.21+
+- Go 1.25+
 - Git
 
 ### 2. 拉取与编译
@@ -57,14 +57,16 @@ bash scripts/run_cluster.sh --clean
 可选运行模式（脚本参数映射）：
 
 ```bash
-# 模式 1：单 Raft 组（默认开发模式）
+# 模式 1：单 Raft 组
 # 参数映射：--arch node-ring
 bash scripts/run_cluster.sh --arch node-ring --servers 3 --base-port 15000 --clean
 
-# 模式 2：多 group 分片（按 group 做一致性哈希）
+# 模式 2：多 group 分片（按 group 做一致性哈希，脚本默认模式）
 # 参数映射：--arch group-ring
 bash scripts/run_cluster.sh --arch group-ring --groups 2 --replicas 3 --base-port 15000 --clean
 ```
+
+说明：当前 `scripts/run_cluster.sh` 默认启动 `group-ring`（`--groups 1 --replicas 3`）。
 
 脚本会自动生成运行元数据与分片配置：
 
@@ -92,8 +94,8 @@ go run cmd/kvmigrate/main.go --dry-run
 3. 全量测试（精简输出）
 	- `bash scripts/test-all.sh`
 4. 性能压测
-	- `go build -o ./benchmarks/benchmark ./benchmarks/benchmark.go`
-	- `./benchmarks/benchmark --servers=3 --clients=10 --duration=30s --maxraftstate=1048576 --sharded=false`
+	- `go build -o ./cmd/benchmarks/benchmark ./cmd/benchmarks/benchmark.go`
+	- `./cmd/benchmarks/benchmark --servers=3 --clients=10 --duration=30s --maxraftstate=1048576 --sharded=false`
 	- 多 group 分片模式建议：`--sharded=true --sharding-config=data/cluster/sharding.json`
 	- 连续压测若要避免历史数据干扰：`bash scripts/test_perf.sh --fresh-run true`
 5. 提交推送
@@ -103,13 +105,15 @@ go run cmd/kvmigrate/main.go --dry-run
 
 ## 架构概览
 
-- `raft/`：Raft 共识（选主、日志复制、提交）
-- `rsm/`：复制状态机（请求编排、提交后应用）
-- `storage/`：BadgerDB 持久化封装
-- `watch/`：订阅与事件分发
-- `sharding/`：一致性哈希与路由
+- `pkg/raft/`：Raft 共识（选主、日志复制、提交）
+- `pkg/rsm/`：复制状态机（请求编排、提交后应用）
+- `pkg/storage/`：BadgerDB 持久化封装
+- `pkg/watch/`：订阅与事件分发
+- `pkg/sharding/`：一致性哈希与路由
+- `pkg/raftapi/`：Raft 与 RSM 接口抽象
+- `pkg/wal/`：预写日志（WAL）分段管理
 - `api/pb/`：Proto 契约与生成代码
-- `raftkv/rpc/`：RPC 类型定义
+- `cmd/`：可执行入口（server、kvcli、kvmigrate、benchmarks）
 
 ### 架构形态
 
@@ -136,10 +140,15 @@ go run cmd/kvmigrate/main.go --dry-run
 
 ## 数据目录说明
 
-运行节点会在仓库根目录产生 `badger-127.0.0.1:PORT/` 数据目录，用于持久化恢复。
+默认情况下，运行数据写入 `data/`（或环境变量 `KV_DATA_DIR` 指定目录），典型结构如下：
+
+- `data/arch-node-ring/node-*/badger-127.0.0.1:PORT/`
+- `data/arch-group-ring/g*-n*/badger-127.0.0.1:PORT/`
+- `data/cluster/runtime.env`
+- `data/cluster/sharding.json`
 
 - 开发期保留：便于重启回放和问题复现
-- 演示前清理：使用 `examples/start_cluster.sh --clean`
+- 演示前清理：使用 `bash scripts/run_cluster.sh --clean`
 
 ## 测试与验证
 
@@ -157,7 +166,14 @@ go test ./...
 
 ## Docker 说明
 
-仓库包含 `Dockerfile` 与 `docker-compose.yml`，当前主要用于本地演示与后续扩展。若用于生产部署，请先校验入口文件、健康检查与配置目录映射是否与当前代码一致。
+容器相关文件位于 `deployments/`：
+
+- `deployments/Dockerfile`
+- `deployments/Dockerfile.benchmark`
+- `deployments/docker-compose.yml`
+- `deployments/prometheus.yml`
+
+当前配置主要用于本地演示与压测扩展。若用于生产部署，请先校验构建上下文、入口文件、健康检查与数据卷映射是否与当前代码一致。
 
 ## 简历展示建议
 

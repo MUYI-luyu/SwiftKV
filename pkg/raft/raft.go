@@ -1010,10 +1010,9 @@ func Make(peers []string, me int,
 	rf.CommitIndex = rf.lastIncludedIndex
 	rf.LastApplied = rf.lastIncludedIndex
 
-	// 删除手动发送快照的代码！
 	// 快照由 InstallSnapshot 和 applier 自动处理
 
-	// ✅ 注册 Raft 为 RPC 服务
+	// 注册 Raft 为 RPC 服务
 	// 注意：TCP 监听由上层 KVServer 负责，不在这里创建
 	rpc.Register(rf)
 
