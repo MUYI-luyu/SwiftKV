@@ -173,7 +173,14 @@ go test ./...
 - `deployments/docker-compose.yml`
 - `deployments/prometheus.yml`
 
-当前配置主要用于本地演示与压测扩展。若用于生产部署，请先校验构建上下文、入口文件、健康检查与数据卷映射是否与当前代码一致。
+当前配置已经对齐当前代码结构，可直接在仓库根目录执行：
+
+```bash
+docker-compose -f deployments/docker-compose.yml up --build
+```
+
+- 如果你的环境还没有 Docker，请先安装 Docker Engine 和 Docker Compose 插件，再执行上面的命令。
+- 若用于生产部署，仍建议先检查端口映射、数据卷、资源限制和监控策略。
 
 ## 简历展示建议
 

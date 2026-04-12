@@ -62,8 +62,8 @@ services:
   # Node 0 - Raft Group 0
   kvraft-node-0:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: deployments/Dockerfile
     container_name: kvraft-node-0
     environment:
       - NODE_ID=0
@@ -93,8 +93,8 @@ services:
   # Node 1 - Raft Group 0
   kvraft-node-1:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: deployments/Dockerfile
     container_name: kvraft-node-1
     environment:
       - NODE_ID=1
@@ -124,8 +124,8 @@ services:
   # Node 2 - Raft Group 0
   kvraft-node-2:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: deployments/Dockerfile
     container_name: kvraft-node-2
     environment:
       - NODE_ID=2
@@ -169,8 +169,8 @@ services:
   # Benchmark 客户端容器
   benchmark:
     build:
-      context: .
-      dockerfile: Dockerfile.benchmark
+      context: ..
+      dockerfile: deployments/Dockerfile.benchmark
     container_name: kvraft-benchmark
     environment:
       - TARGET_NODES=kvraft-node-0:6000,kvraft-node-1:6001,kvraft-node-2:6002
@@ -178,6 +178,7 @@ services:
       - NUM_CLIENTS=10
       - NUM_REQUESTS=10000
       - REDIS_ADDR=redis:6379
+      - DURATION=30s
     depends_on:
       - kvraft-node-0
       - kvraft-node-1
@@ -187,6 +188,31 @@ services:
       - kvraft-net
     profiles:
       - benchmark  # 启动 benchmark: docker-compose --profile benchmark up
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        case "$BENCHMARK_TYPE" in
+          read)
+            READ_RATIO=1.0
+            ;;
+          write)
+            READ_RATIO=0.0
+            ;;
+          mixed)
+            READ_RATIO=${READ_RATIO:-0.5}
+            ;;
+          *)
+            READ_RATIO=${READ_RATIO:-0.5}
+            ;;
+        esac
+        exec /app/benchmark \
+          -server-addrs="$TARGET_NODES" \
+          -clients="$NUM_CLIENTS" \
+          -requests="$NUM_REQUESTS" \
+          -duration="${DURATION:-30s}" \
+          -read-ratio="$READ_RATIO" \
+          -sharded=false
 
 # ============================================================
 # 网络配置

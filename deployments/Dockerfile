@@ -1,13 +1,13 @@
 # ============================================================
 # Dockerfile for KVraft Server
-# 基于 Go 1.21 构建多阶段镜像
+# 基于 Go 1.25 构建多阶段镜像
 # ============================================================
 
 # 构建阶段
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
-RUN apk add --no-cache git gcc musl-dev
+RUN apk add --no-cache git
 
 # 复制 go.mod 和 go.sum
 COPY go.mod go.sum ./
@@ -18,17 +18,11 @@ RUN go mod download
 # 复制源代码
 COPY . .
 
-# 生成 Proto 文件的 Go 代码（如果需要）
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest && \
-    go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest && \
-    go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@latest
-
 # 编译主程序
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-s -w" \
     -o /app/kvraft-server \
-    ./cmd/server/main.go
+    ./cmd/server
 
 # 运行阶段
 FROM alpine:3.18
@@ -43,6 +37,8 @@ COPY --from=builder /app/kvraft-server /app/kvraft-server
 
 # 创建数据目录
 RUN mkdir -p /data && chmod 777 /data
+
+ENV KV_DATA_DIR=/data
 
 # 暴露端口
 EXPOSE 50000 6000 8001 9100
