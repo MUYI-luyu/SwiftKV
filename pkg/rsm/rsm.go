@@ -20,8 +20,10 @@ var useRaftStateMachine bool // 用于选择另一个 Raft 实现（未使用）
 
 type Persister interface {
 	ReadRaftState() []byte
+	ReadHardState() []byte
 	ReadSnapshot() []byte
 	Save(raftstate []byte, snapshot []byte)
+	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
 
@@ -129,8 +131,8 @@ func MakeRSM(
 		idCounter:    0,
 		waitingOps:   make(map[int]*waitingOp),
 		watchMgr:     watch.NewManager(watch.DefaultConfig()),
-		snapMinDelta: 256,
-		snapMinGap:   500 * time.Millisecond,
+		snapMinDelta: 64,
+		snapMinGap:   200 * time.Millisecond,
 	}
 	rsm.shutdown.Store(false)
 	rsm.leaseRead.Store(true)
@@ -403,7 +405,7 @@ func (rsm *RSM) shouldCreateSnapshot(commandIndex int) bool {
 	if rsm.maxraftstate == -1 {
 		return false
 	}
-	if rsm.rf.PersistBytes() <= (rsm.maxraftstate*19)/20 {
+	if rsm.rf.PersistBytes() <= (rsm.maxraftstate*3)/4 {
 		return false
 	}
 	rsm.mu.Lock()

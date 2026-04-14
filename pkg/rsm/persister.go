@@ -35,6 +35,7 @@ type FilePersister struct {
 	mu            sync.RWMutex
 	dataDir       string
 	raftStateFile string
+	hardStateFile string
 	snapshotFile  string
 	manifestPath  string
 	tmpDir        string
@@ -57,6 +58,7 @@ func NewFilePersister(dataDir string) (*FilePersister, error) {
 	fp := &FilePersister{
 		dataDir:       dataDir,
 		raftStateFile: filepath.Join(dataDir, "raft-state.bin"),
+		hardStateFile: filepath.Join(dataDir, "hard-state.bin"),
 		snapshotFile:  filepath.Join(dataDir, "snapshot.bin"),
 		manifestPath:  filepath.Join(dataDir, manifestFileName),
 		tmpDir:        filepath.Join(dataDir, ".tmp"),
@@ -99,6 +101,16 @@ func (fp *FilePersister) ReadSnapshot() []byte {
 	return data
 }
 
+// ReadHardState 读取 Raft 硬状态（CurrentTerm/VotedFor）
+func (fp *FilePersister) ReadHardState() []byte {
+	fp.mu.RLock()
+	path := fp.hardStateFile
+	fp.mu.RUnlock()
+
+	data, _ := os.ReadFile(path)
+	return data
+}
+
 // Save 原子地保存 Raft 状态和快照
 // 使用 write-then-rename 模式避免崩溃损坏
 func (fp *FilePersister) Save(raftstate []byte, snapshot []byte) {
@@ -127,6 +139,22 @@ func (fp *FilePersister) Save(raftstate []byte, snapshot []byte) {
 
 	if err := <-req.done; err != nil {
 		fmt.Fprintf(os.Stderr, "[FilePersister] failed to save state/snapshot: %v\n", err)
+	}
+}
+
+// SaveHardState 持久化 Raft 硬状态（CurrentTerm/VotedFor）
+func (fp *FilePersister) SaveHardState(hardstate []byte) {
+	fp.mu.RLock()
+	if fp.closed {
+		fp.mu.RUnlock()
+		fmt.Fprintf(os.Stderr, "[FilePersister] save hard-state ignored: persister closed\n")
+		return
+	}
+	path := fp.hardStateFile
+	fp.mu.RUnlock()
+
+	if err := fp.durableWrite(path, append([]byte(nil), hardstate...)); err != nil {
+		fmt.Fprintf(os.Stderr, "[FilePersister] failed to save hard-state: %v\n", err)
 	}
 }
 
@@ -170,18 +198,33 @@ func (fp *FilePersister) runSaveWorker() {
 func (fp *FilePersister) commitGeneration(raftstate []byte, snapshot []byte) error {
 	fp.mu.Lock()
 	nextGen := fp.manifest.Generation + 1
+	prevSnapshotRel := fp.manifest.SnapshotRel
 	fp.mu.Unlock()
 
 	raftRel := fmt.Sprintf("raft-state.%020d.bin", nextGen)
-	snapshotRel := fmt.Sprintf("snapshot.%020d.bin", nextGen)
 	raftPath := filepath.Join(fp.dataDir, raftRel)
-	snapshotPath := filepath.Join(fp.dataDir, snapshotRel)
+	snapshotRel := prevSnapshotRel
 
 	if err := fp.durableWrite(raftPath, raftstate); err != nil {
 		return fmt.Errorf("durable write raft state: %w", err)
 	}
-	if err := fp.durableWrite(snapshotPath, snapshot); err != nil {
-		return fmt.Errorf("durable write snapshot: %w", err)
+
+	// 仅在调用方显式提供 snapshot 时重写 snapshot 文件，
+	// 常规 Raft persist（snapshot=nil）不触发 snapshot IO。
+	if snapshot != nil {
+		snapshotRel = fmt.Sprintf("snapshot.%020d.bin", nextGen)
+		snapshotPath := filepath.Join(fp.dataDir, snapshotRel)
+		if err := fp.durableWrite(snapshotPath, snapshot); err != nil {
+			return fmt.Errorf("durable write snapshot: %w", err)
+		}
+	}
+
+	if snapshotRel == "" {
+		snapshotRel = fmt.Sprintf("snapshot.%020d.bin", nextGen)
+		snapshotPath := filepath.Join(fp.dataDir, snapshotRel)
+		if err := fp.durableWrite(snapshotPath, nil); err != nil {
+			return fmt.Errorf("durable write bootstrap snapshot: %w", err)
+		}
 	}
 
 	m := persisterManifest{

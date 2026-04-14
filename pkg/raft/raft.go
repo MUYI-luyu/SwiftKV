@@ -21,16 +21,12 @@ import (
 	//	tester "6.5840/tester1"
 )
 
-var persistBufferPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
-
 type Persister interface {
 	ReadRaftState() []byte
+	ReadHardState() []byte
 	ReadSnapshot() []byte
 	Save(raftstate []byte, snapshot []byte)
+	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
 
@@ -51,6 +47,11 @@ type persistentState struct {
 	Log               []LogEntry
 	LastIncludedIndex int
 	LastIncludedTerm  int
+}
+
+type hardState struct {
+	CurrentTerm int
+	VotedFor    int
 }
 
 // 实现单个 Raft 节点的 Go 对象。
@@ -185,10 +186,19 @@ func (rf *Raft) getTerm(index int) int {
 
 // 将 Raft 的持久状态保存到稳定存储中，
 // 以便在崩溃并重启后能够恢复。
-func (rf *Raft) persist() {
-	data := encodePersistentState(rf.capturePersistentState())
-	// Regular persist does not need to rewrite snapshot each time.
-	rf.persister.Save(data, nil)
+func (rf *Raft) persist(snapshot []byte) {
+	state := persistentState{
+		CurrentTerm:       rf.CurrentTerm,
+		VotedFor:          rf.VotedFor,
+		Log:               rf.log,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+	}
+	rf.persister.Save(encodePersistentState(state), snapshot)
+}
+
+func (rf *Raft) persistHardState() {
+	rf.persister.SaveHardState(encodeHardState(rf.CurrentTerm, rf.VotedFor))
 }
 
 // 恢复先前持久化的状态。
@@ -222,6 +232,25 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastIncludedTerm = lastIncludedTerm
 }
 
+func (rf *Raft) readHardState(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	var hs hardState
+	if d.Decode(&hs.CurrentTerm) != nil || d.Decode(&hs.VotedFor) != nil {
+		return
+	}
+
+	if hs.CurrentTerm > rf.CurrentTerm || (hs.CurrentTerm == rf.CurrentTerm && hs.VotedFor != -1) {
+		rf.CurrentTerm = hs.CurrentTerm
+		rf.VotedFor = hs.VotedFor
+	}
+}
+
 // 返回 Raft 持久化日志的字节数。
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
@@ -229,26 +258,8 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-func (rf *Raft) persistWithSnapshot(snapshot []byte) {
-	state := encodePersistentState(rf.capturePersistentState())
-	rf.persister.Save(state, snapshot)
-}
-
-func (rf *Raft) capturePersistentState() persistentState {
-	logs := make([]LogEntry, len(rf.log))
-	copy(logs, rf.log)
-	return persistentState{
-		CurrentTerm:       rf.CurrentTerm,
-		VotedFor:          rf.VotedFor,
-		Log:               logs,
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm:  rf.lastIncludedTerm,
-	}
-}
-
 func encodePersistentState(s persistentState) []byte {
-	buf := persistBufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
+	buf := new(bytes.Buffer)
 	enc := gob.NewEncoder(buf)
 
 	_ = enc.Encode(s.CurrentTerm)
@@ -257,13 +268,17 @@ func encodePersistentState(s persistentState) []byte {
 	_ = enc.Encode(s.LastIncludedIndex)
 	_ = enc.Encode(s.LastIncludedTerm)
 
-	data := append([]byte(nil), buf.Bytes()...)
-	if buf.Cap() <= 1<<20 {
-		persistBufferPool.Put(buf)
-	} else {
-		persistBufferPool.Put(new(bytes.Buffer))
-	}
-	return data
+	return append([]byte(nil), buf.Bytes()...)
+}
+
+func encodeHardState(currentTerm, votedFor int) []byte {
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+
+	_ = enc.Encode(currentTerm)
+	_ = enc.Encode(votedFor)
+
+	return append([]byte(nil), buf.Bytes()...)
 }
 
 // 服务端通知 Raft：它已创建了一个包含
@@ -312,7 +327,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	// 7. 持久化 (状态 + snapshot)
-	rf.persistWithSnapshot(snapshot)
+	rf.persist(snapshot)
 }
 
 // RequestVote RPC 参数结构体
@@ -344,7 +359,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 		rf.CurrentTerm = args.Term
 		rf.state = Follower
 		rf.VotedFor = -1
-		rf.persist()
+		rf.persistHardState()
 	}
 
 	if args.LastLogTerm < rf.getLastLogTerm() ||
@@ -356,7 +371,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	if rf.VotedFor == -1 || rf.VotedFor == args.CandidateId {
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
-		rf.persist()
+		rf.persistHardState()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -407,7 +422,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.Term > rf.CurrentTerm {
 			rf.CurrentTerm = args.Term
 			rf.VotedFor = -1
-			rf.persist()
+			rf.persistHardState()
 		}
 		rf.state = Follower
 	}
@@ -465,7 +480,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				cut = 1
 			}
 			rf.log = rf.log[:cut]
-			rf.persist()
+			rf.persist(nil)
 			break
 		}
 	}
@@ -474,7 +489,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 注意：只追加 follower 没有的部分
 	if i < len(args.Entries) {
 		rf.log = append(rf.log, args.Entries[i:]...)
-		rf.persist()
+		rf.persist(nil)
 	}
 
 	// // ---（第 8 步）更新 CommitIndex ---
@@ -524,7 +539,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	})
-	rf.persist()
+	rf.persist(nil)
 	// 新日志到达时触发一次快速复制，避免每次 Start 都创建复制 goroutine。
 	select {
 	case rf.replicateTrigger <- struct{}{}:
@@ -576,7 +591,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
 		rf.state = Follower
-		rf.persist()
+		rf.persistHardState()
 	}
 
 	rf.resetElectionTimer()
@@ -610,7 +625,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.CommitIndex = max(rf.CommitIndex, rf.lastIncludedIndex)
 	rf.LastApplied = max(rf.LastApplied, rf.lastIncludedIndex)
 
-	rf.persistWithSnapshot(args.Data)
+	rf.persist(args.Data)
 
 	// 保存 snapshot 数据
 	snapshotData := args.Data
@@ -681,7 +696,7 @@ func (rf *Raft) sendHeartbeats() {
 					rf.CurrentTerm = reply.Term
 					rf.state = Follower
 					rf.VotedFor = -1
-					rf.persist()
+					rf.persistHardState()
 					rf.mu.Unlock()
 					return
 				}
@@ -748,7 +763,7 @@ func (rf *Raft) sendHeartbeats() {
 				rf.CurrentTerm = reply.Term
 				rf.state = Follower
 				rf.VotedFor = -1
-				rf.persist()
+				rf.persistHardState()
 				return
 			}
 
@@ -871,7 +886,7 @@ func (rf *Raft) handleVoteResponse(peer int, args *RequestVoteArgs, reply *Reque
 		rf.CurrentTerm = reply.Term
 		rf.state = Follower
 		rf.VotedFor = -1
-		rf.persist()
+		rf.persistHardState()
 		return
 	}
 
@@ -899,7 +914,7 @@ func (rf *Raft) startElection() {
 	rf.state = Candidate
 	rf.CurrentTerm++
 	rf.VotedFor = rf.me
-	rf.persist()
+	rf.persistHardState()
 	rf.Votes = 1
 	rf.resetElectionTimer()
 
@@ -1027,6 +1042,7 @@ func Make(peers []string, me int,
 
 	// 从崩溃前的持久化状态中恢复
 	rf.readPersist(persister.ReadRaftState())
+	rf.readHardState(persister.ReadHardState())
 	rf.CommitIndex = rf.lastIncludedIndex
 	rf.LastApplied = rf.lastIncludedIndex
 
