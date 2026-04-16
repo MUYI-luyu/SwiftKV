@@ -336,7 +336,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, int64, kvraftapi.E
 				return "", 0, 0, kvraftapi.ErrWrongLeader
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -37,10 +37,11 @@ type WALRequest struct {
 
 // Logger persists entries in JSONL format for easy audit and recovery.
 type Logger struct {
-	mu      sync.Mutex
-	path    string
-	file    *os.File
-	enabled bool
+	mu          sync.Mutex
+	path        string
+	file        *os.File
+	enabled     bool
+	syncOnWrite bool
 
 	reqCh       chan WALRequest
 	stopCh      chan struct{}
@@ -51,8 +52,8 @@ type Logger struct {
 	replayDone  bool
 }
 
-func NewLogger(path string, enabled bool) (*Logger, error) {
-	l := &Logger{path: path, enabled: enabled}
+func NewLogger(path string, enabled bool, syncOnWrite bool) (*Logger, error) {
+	l := &Logger{path: path, enabled: enabled, syncOnWrite: syncOnWrite}
 	if !enabled {
 		return l, nil
 	}
@@ -414,7 +415,7 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 			_, _ = buf.Write(batch[i].Data)
 		}
 
-		err := writeAndSync(file, buf.Bytes())
+		err := writeAndSync(file, buf.Bytes(), l.syncOnWrite)
 		if err != nil {
 			l.setFatalErr(err)
 			workerErr = err
@@ -447,8 +448,8 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 	}
 }
 
-// 单批 payload 写入并 file.Sync
-func writeAndSync(file *os.File, payload []byte) error {
+// 单批 payload 写入并按需 file.Sync
+func writeAndSync(file *os.File, payload []byte, syncOnWrite bool) error {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -460,7 +461,7 @@ func writeAndSync(file *os.File, payload []byte) error {
 	if err == nil && n != len(payload) {
 		err = io.ErrShortWrite
 	}
-	if err == nil {
+	if err == nil && syncOnWrite {
 		err = file.Sync()
 	}
 	if err != nil {

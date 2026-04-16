@@ -11,6 +11,9 @@ import (
 	"encoding/gob"
 	"math/rand"
 	"net/rpc"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,10 +86,12 @@ type Raft struct {
 
 	applyCh chan raftapi.ApplyMsg
 
-	heartbeatInterval time.Duration
-	replicateTrigger  chan struct{}
-	leaseRatio        float64
-	leaseUntil        time.Time
+	heartbeatInterval  time.Duration
+	replicateTrigger   chan struct{}
+	leaseRatio         float64
+	leaseUntil         time.Time
+	leaseUntilUnixNano int64
+	stateAtomic        int32
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
@@ -150,6 +155,58 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.CurrentTerm, rf.state == Leader
 }
 
+func (rf *Raft) setStateLocked(state int) {
+	rf.state = state
+	atomic.StoreInt32(&rf.stateAtomic, int32(state))
+}
+
+func (rf *Raft) setLeaseUntilLocked(t time.Time) {
+	rf.leaseUntil = t
+	atomic.StoreInt64(&rf.leaseUntilUnixNano, t.UnixNano())
+}
+
+func durationMsFromEnv(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func floatFromEnv(name string, def float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func (rf *Raft) leaseDurationLocked() time.Duration {
+	leaseDur := time.Duration(float64(rf.heartbeatInterval) * rf.leaseRatio)
+	maxLease := rf.electionTimeout - 20*time.Millisecond
+	if maxLease <= 0 {
+		maxLease = rf.electionTimeout / 2
+	}
+	if maxLease <= 0 {
+		maxLease = 100 * time.Millisecond
+	}
+	if leaseDur > maxLease {
+		leaseDur = maxLease
+	}
+	if leaseDur <= 0 {
+		leaseDur = 100 * time.Millisecond
+	}
+	return leaseDur
+}
+
 // GetLastIncludedIndex 返回当前快照覆盖到的最大日志索引。
 func (rf *Raft) GetLastIncludedIndex() int {
 	rf.mu.Lock()
@@ -178,12 +235,14 @@ func (rf *Raft) SyncAppliedIndex(index int) {
 
 // IsLeaderWithLease returns true only when this node is leader and the lease is still valid.
 func (rf *Raft) IsLeaderWithLease() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Leader || rf.killed() {
+	if rf.killed() {
 		return false
 	}
-	return time.Now().Before(rf.leaseUntil)
+	if int(atomic.LoadInt32(&rf.stateAtomic)) != Leader {
+		return false
+	}
+	leaseUntil := atomic.LoadInt64(&rf.leaseUntilUnixNano)
+	return time.Now().UnixNano() < leaseUntil
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -377,7 +436,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 
 	if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
-		rf.state = Follower
+		rf.setStateLocked(Follower)
 		rf.VotedFor = -1
 		rf.persistHardState()
 	}
@@ -444,7 +503,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.VotedFor = -1
 			rf.persistHardState()
 		}
-		rf.state = Follower
+		rf.setStateLocked(Follower)
 	}
 
 	reply.Term = rf.CurrentTerm
@@ -610,7 +669,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
-		rf.state = Follower
+		rf.setStateLocked(Follower)
+		rf.setLeaseUntilLocked(time.Unix(0, 0))
 		rf.persistHardState()
 	}
 
@@ -714,7 +774,8 @@ func (rf *Raft) sendHeartbeats() {
 
 				if reply.Term > rf.CurrentTerm {
 					rf.CurrentTerm = reply.Term
-					rf.state = Follower
+					rf.setStateLocked(Follower)
+					rf.setLeaseUntilLocked(time.Unix(0, 0))
 					rf.VotedFor = -1
 					rf.persistHardState()
 					rf.mu.Unlock()
@@ -781,7 +842,8 @@ func (rf *Raft) sendHeartbeats() {
 			// 如果收到的 Term 更大，说明需要转换为 Follower
 			if reply.Term > rf.CurrentTerm {
 				rf.CurrentTerm = reply.Term
-				rf.state = Follower
+				rf.setStateLocked(Follower)
+				rf.setLeaseUntilLocked(time.Unix(0, 0))
 				rf.VotedFor = -1
 				rf.persistHardState()
 				return
@@ -797,8 +859,8 @@ func (rf *Raft) sendHeartbeats() {
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
 				n := atomic.AddInt32(&successCount, 1)
 				if n > int32(len(rf.peers)/2) {
-					d := time.Duration(float64(rf.heartbeatInterval) * rf.leaseRatio)
-					rf.leaseUntil = time.Now().Add(d)
+					d := rf.leaseDurationLocked()
+					rf.setLeaseUntilLocked(time.Now().Add(d))
 				}
 			} else {
 				if reply.ConflictTerm == -1 {
@@ -885,9 +947,9 @@ func (rf *Raft) leaderLoop() {
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.state = Leader
-	d := time.Duration(float64(rf.heartbeatInterval) * rf.leaseRatio)
-	rf.leaseUntil = time.Now().Add(d)
+	rf.setStateLocked(Leader)
+	d := rf.leaseDurationLocked()
+	rf.setLeaseUntilLocked(time.Now().Add(d))
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		rf.matchIndex[i] = 0
@@ -904,7 +966,8 @@ func (rf *Raft) handleVoteResponse(peer int, args *RequestVoteArgs, reply *Reque
 	// 收到比自己大的 term，变回 follower
 	if reply.Term > rf.CurrentTerm {
 		rf.CurrentTerm = reply.Term
-		rf.state = Follower
+		rf.setStateLocked(Follower)
+		rf.setLeaseUntilLocked(time.Unix(0, 0))
 		rf.VotedFor = -1
 		rf.persistHardState()
 		return
@@ -931,7 +994,8 @@ func (rf *Raft) handleVoteResponse(peer int, args *RequestVoteArgs, reply *Reque
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	rf.state = Candidate
+	rf.setStateLocked(Candidate)
+	rf.setLeaseUntilLocked(time.Unix(0, 0))
 	rf.CurrentTerm++
 	rf.VotedFor = rf.me
 	rf.persistHardState()
@@ -1042,7 +1106,7 @@ func Make(peers []string, me int,
 	rf.electionTimeout = time.Duration(300+rand.Intn(200)) * time.Millisecond
 	rf.lastHeard = time.Now()
 
-	rf.state = Follower
+	rf.setStateLocked(Follower)
 	rf.VotedFor = -1
 	rf.log = []LogEntry{{Term: 0}}
 	rf.CommitIndex = 0
@@ -1055,10 +1119,10 @@ func Make(peers []string, me int,
 
 	rf.applyCh = applyCh
 	rf.rpcClients = make(map[string]*rpc.Client, len(peers))
-	rf.heartbeatInterval = 80 * time.Millisecond
+	rf.heartbeatInterval = durationMsFromEnv("RAFT_HEARTBEAT_INTERVAL_MS", 80*time.Millisecond)
 	rf.replicateTrigger = make(chan struct{}, 1)
-	rf.leaseRatio = 1.5
-	rf.leaseUntil = time.Now()
+	rf.leaseRatio = floatFromEnv("RAFT_LEASE_RATIO", 1.5)
+	rf.setLeaseUntilLocked(time.Now())
 
 	// 从崩溃前的持久化状态中恢复
 	rf.readPersist(persister.ReadRaftState())

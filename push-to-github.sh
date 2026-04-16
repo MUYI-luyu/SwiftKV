@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="feat(wal): implement log truncation and replay mechanism"
+COMMIT_MSG="perf(lease): optimize read path with lock-free validation and configurability"
 RUN_TEST=1
 DRY_RUN=0
 

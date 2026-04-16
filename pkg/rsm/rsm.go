@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,6 +88,36 @@ type RSM struct {
 	snapMinGap    time.Duration
 }
 
+func leaseReadEnabledFromEnv() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("KV_LEASE_READ")))
+	if v == "" {
+		return true
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func boolEnvDefault(name string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
 // Close 优雅关闭 RSM 相关后台组件。
 func (rsm *RSM) Close() {
 	if !rsm.shutdown.CompareAndSwap(false, true) {
@@ -138,16 +169,20 @@ func MakeRSM(
 		snapMinGap:   200 * time.Millisecond,
 	}
 	rsm.shutdown.Store(false)
-	rsm.leaseRead.Store(true)
+	rsm.leaseRead.Store(leaseReadEnabledFromEnv())
 	// 根据当前节点 ID 生成预写日志（WAL）的绝对路径
 	walPath := filepath.Join(runtimeDataRoot(), "wal", fmt.Sprintf("rsm-node-%d.log", me))
-	walLogger, err := wal.NewLogger(walPath, true)
+	walEnabled := boolEnvDefault("KV_WAL_ENABLED", true)
+	walSync := boolEnvDefault("KV_WAL_SYNC", true)
+	walLogger, err := wal.NewLogger(walPath, walEnabled, walSync)
 	if err != nil {
 		log.Printf("[RSM-%d] WAL disabled due to init error: %v", me, err)
 	} else {
 		rsm.walLogger = walLogger
+		log.Printf("[RSM-%d] wal enabled=%v sync=%v", me, walEnabled, walSync)
 	}
 	rsm.rf = raft.Make(peers, me, persister, rsm.applyCh)
+	log.Printf("[RSM-%d] lease-read enabled=%v", me, rsm.leaseRead.Load())
 	rsm.lastSnapAt = time.Now()
 	snapshot := persister.ReadSnapshot()
 	if len(snapshot) > 0 {
