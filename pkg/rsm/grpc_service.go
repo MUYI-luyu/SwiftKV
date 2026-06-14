@@ -11,7 +11,7 @@ import (
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
-	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/kv"
 	"kvraft/pkg/watch"
 
 	"google.golang.org/grpc"
@@ -40,25 +40,25 @@ func grpcAddrFromRPC(addr string) string {
 	return net.JoinHostPort(host, strconv.Itoa(p+1000))
 }
 
-func errReply(e kvraftapi.Err) string {
+func errReply(e kv.Err) string {
 	return string(e)
 }
 
 func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	if s.kv.killed() {
 		s.kv.stats.RecordFailure()
-		return &pb.GetResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
+		return &pb.GetResponse{Error: errReply(kv.ErrWrongLeader)}, nil
 	}
 
-	err, ret, leaseHit := s.kv.rsm.SubmitLeaseReadWithMode(&kvraftapi.GetArgs{Key: req.GetKey()})
-	if err != kvraftapi.OK {
+	err, ret, leaseHit := s.kv.rsm.SubmitLeaseReadWithMode(&kv.GetArgs{Key: req.GetKey()})
+	if err != kv.OK {
 		s.kv.stats.RecordFailure()
 		s.kv.stats.RecordLeaseFallback()
 		return &pb.GetResponse{Error: errReply(err)}, nil
 	}
 
 	// 判断 ret 是否为预期的 GetReply 类型
-	reply, ok := ret.(kvraftapi.GetReply)
+	reply, ok := ret.(kv.GetReply)
 	if !ok {
 		s.kv.stats.RecordFailure()
 		return &pb.GetResponse{Error: "ErrInternal"}, nil
@@ -83,16 +83,16 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 
 func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	if s.kv.killed() {
-		return &pb.PutResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
+		return &pb.PutResponse{Error: errReply(kv.ErrWrongLeader)}, nil
 	}
 
-	args := &kvraftapi.PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: kvraftapi.Tversion(req.GetVersion()), TTL: req.GetTtlSeconds()}
+	args := &kv.PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: kv.Tversion(req.GetVersion()), TTL: req.GetTtlSeconds()}
 	err, ret := s.kv.rsm.Submit(args)
-	if err != kvraftapi.OK {
+	if err != kv.OK {
 		return &pb.PutResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kvraftapi.PutReply)
+	reply, ok := ret.(kv.PutReply)
 	if !ok {
 		return &pb.PutResponse{Error: "ErrInternal"}, nil
 	}
@@ -102,15 +102,15 @@ func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRes
 
 func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	if s.kv.killed() {
-		return &pb.DeleteResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
+		return &pb.DeleteResponse{Error: errReply(kv.ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.Submit(&kvraftapi.DeleteArgs{Key: req.GetKey()})
-	if err != kvraftapi.OK {
+	err, ret := s.kv.rsm.Submit(&kv.DeleteArgs{Key: req.GetKey()})
+	if err != kv.OK {
 		return &pb.DeleteResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kvraftapi.DeleteReply)
+	reply, ok := ret.(kv.DeleteReply)
 	if !ok {
 		return &pb.DeleteResponse{Error: "ErrInternal"}, nil
 	}
@@ -120,15 +120,15 @@ func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.
 
 func (s *grpcKVService) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
 	if s.kv.killed() {
-		return &pb.ScanResponse{Error: errReply(kvraftapi.ErrWrongLeader)}, nil
+		return &pb.ScanResponse{Error: errReply(kv.ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.Submit(&kvraftapi.ScanArgs{Prefix: req.GetPrefix(), Limit: req.GetLimit()})
-	if err != kvraftapi.OK {
+	err, ret := s.kv.rsm.Submit(&kv.ScanArgs{Prefix: req.GetPrefix(), Limit: req.GetLimit()})
+	if err != kv.OK {
 		return &pb.ScanResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kvraftapi.ScanReply)
+	reply, ok := ret.(kv.ScanReply)
 	if !ok {
 		return &pb.ScanResponse{Error: "ErrInternal"}, nil
 	}

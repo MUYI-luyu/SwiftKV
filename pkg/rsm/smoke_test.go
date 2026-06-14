@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	kvraftapi "kvraft/pkg/raftapi"
+	kvapi "kvraft/pkg/kv"
 	"kvraft/pkg/storage"
 	"kvraft/pkg/watch"
 )
@@ -126,19 +126,19 @@ func TestBasicPutGet(t *testing.T) {
 	// ============================================================
 	// 测试 1: Put 操作
 	// ============================================================
-	putArgs := &kvraftapi.PutArgs{
+	putArgs := &kvapi.PutArgs{
 		Key:     "test_key",
 		Value:   "test_value",
 		Version: 0, // 新 key，版本为 0
 	}
 
 	putResult := kv.DoOp(putArgs)
-	putReply, ok := putResult.(kvraftapi.PutReply)
+	putReply, ok := putResult.(kvapi.PutReply)
 	if !ok {
 		t.Fatalf("❌ Put 返回类型错误，期望 PutReply，收到 %T", putResult)
 	}
 
-	if putReply.Err != kvraftapi.OK {
+	if putReply.Err != kvapi.OK {
 		t.Fatalf("❌ Put 操作失败，Err=%v（期望 OK）", putReply.Err)
 	}
 	t.Log("【Step 2】执行 Put 操作：✓ Key=test_key, Value=test_value")
@@ -146,17 +146,17 @@ func TestBasicPutGet(t *testing.T) {
 	// ============================================================
 	// 测试 2: Get 操作 - 验证数据正确保存
 	// ============================================================
-	getArgs := &kvraftapi.GetArgs{
+	getArgs := &kvapi.GetArgs{
 		Key: "test_key",
 	}
 
 	getResult := kv.DoOp(getArgs)
-	getReply, ok := getResult.(kvraftapi.GetReply)
+	getReply, ok := getResult.(kvapi.GetReply)
 	if !ok {
 		t.Fatalf("❌ Get 返回类型错误，期望 GetReply，收到 %T", getResult)
 	}
 
-	if getReply.Err != kvraftapi.OK {
+	if getReply.Err != kvapi.OK {
 		t.Fatalf("❌ Get 操作失败，Err=%v（期望 OK）", getReply.Err)
 	}
 
@@ -168,19 +168,19 @@ func TestBasicPutGet(t *testing.T) {
 	// ============================================================
 	// 测试 4: 版本控制 - 尝试以错误版本写入
 	// ============================================================
-	putArgsWrongVersion := &kvraftapi.PutArgs{
+	putArgsWrongVersion := &kvapi.PutArgs{
 		Key:     "test_key",
 		Value:   "new_value",
 		Version: 0, // 错误的版本（当前版本是 1）
 	}
 
 	putResult2 := kv.DoOp(putArgsWrongVersion)
-	putReply2, ok := putResult2.(kvraftapi.PutReply)
+	putReply2, ok := putResult2.(kvapi.PutReply)
 	if !ok {
 		t.Fatalf("❌ Put 返回类型错误，期望 PutReply，收到 %T", putResult2)
 	}
 
-	if putReply2.Err != kvraftapi.ErrVersion {
+	if putReply2.Err != kvapi.ErrVersion {
 		t.Fatalf("❌ 版本冲突检测失败，期望 ErrVersion，收到 %v", putReply2.Err)
 	}
 	t.Log("【Step 4】验证版本控制：✓ 错误版本正确拒绝")
@@ -188,17 +188,17 @@ func TestBasicPutGet(t *testing.T) {
 	// ============================================================
 	// 测试 5: 不存在的 key 读取
 	// ============================================================
-	getArgsNotFound := &kvraftapi.GetArgs{
+	getArgsNotFound := &kvapi.GetArgs{
 		Key: "nonexistent_key",
 	}
 
 	getResult2 := kv.DoOp(getArgsNotFound)
-	getReply2, ok := getResult2.(kvraftapi.GetReply)
+	getReply2, ok := getResult2.(kvapi.GetReply)
 	if !ok {
 		t.Fatalf("❌ Get 返回类型错误，期望 GetReply，收到 %T", getResult2)
 	}
 
-	if getReply2.Err != kvraftapi.ErrNoKey {
+	if getReply2.Err != kvapi.ErrNoKey {
 		t.Fatalf("❌ 不存在 key 处理失败，期望 ErrNoKey，收到 %v", getReply2.Err)
 	}
 	t.Log("【Step 5】验证 ErrNoKey：✓ 不存在的 key 正确处理")
@@ -206,28 +206,28 @@ func TestBasicPutGet(t *testing.T) {
 	// ============================================================
 	// 测试 6: 更新存在的 key
 	// ============================================================
-	putArgsUpdate := &kvraftapi.PutArgs{
+	putArgsUpdate := &kvapi.PutArgs{
 		Key:     "test_key",
 		Value:   "updated_value",
 		Version: 1, // 正确的当前版本
 	}
 
 	putResult3 := kv.DoOp(putArgsUpdate)
-	putReply3, ok := putResult3.(kvraftapi.PutReply)
+	putReply3, ok := putResult3.(kvapi.PutReply)
 	if !ok {
 		t.Fatalf("❌ Put 返回类型错误，期望 PutReply，收到 %T", putResult3)
 	}
 
-	if putReply3.Err != kvraftapi.OK {
+	if putReply3.Err != kvapi.OK {
 		t.Fatalf("❌ 更新 Put 操作失败，Err=%v（期望 OK）", putReply3.Err)
 	}
 	t.Log("【Step 6】执行更新 Put 操作：✓ Key=test_key, Value=updated_value, Version=2")
 
-	getArgs2 := &kvraftapi.GetArgs{
+	getArgs2 := &kvapi.GetArgs{
 		Key: "test_key",
 	}
 	getResult4 := kv.DoOp(getArgs2)
-	getReply4, ok := getResult4.(kvraftapi.GetReply)
+	getReply4, ok := getResult4.(kvapi.GetReply)
 	if !ok {
 		t.Fatalf("❌ Get 返回类型错误，期望 GetReply，收到 %T", getResult4)
 	}
@@ -288,18 +288,18 @@ func TestWatchMechanism(t *testing.T) {
 
 	t.Log("【Step 2】订阅 watch_test_key：✓")
 
-	putArgs := &kvraftapi.PutArgs{
+	putArgs := &kvapi.PutArgs{
 		Key:     watchKey,
 		Value:   "gold_value",
 		Version: 0,
 	}
 
 	putResult := kv.DoOp(putArgs)
-	putReply, ok := putResult.(kvraftapi.PutReply)
+	putReply, ok := putResult.(kvapi.PutReply)
 	if !ok {
 		t.Fatalf("❌ Put 返回类型错误，期望 PutReply，收到 %T", putResult)
 	}
-	if putReply.Err != kvraftapi.OK {
+	if putReply.Err != kvapi.OK {
 		t.Fatalf("❌ Put 操作失败，Err=%v（期望 OK）", putReply.Err)
 	}
 
@@ -351,7 +351,7 @@ func TestWatchDeleteEvent(t *testing.T) {
 	}
 
 	const key = "delete_watch_key"
-	if putRes := kv.DoOp(&kvraftapi.PutArgs{Key: key, Value: "before_delete", Version: 0}); putRes.(kvraftapi.PutReply).Err != kvraftapi.OK {
+	if putRes := kv.DoOp(&kvapi.PutArgs{Key: key, Value: "before_delete", Version: 0}); putRes.(kvapi.PutReply).Err != kvapi.OK {
 		t.Fatalf("❌ 预置数据失败")
 	}
 
@@ -363,13 +363,13 @@ func TestWatchDeleteEvent(t *testing.T) {
 		_ = watchMgr.Unsubscribe(watcher.ID)
 	}()
 
-	delArgs := &kvraftapi.DeleteArgs{Key: key}
+	delArgs := &kvapi.DeleteArgs{Key: key}
 	delResult := kv.DoOp(delArgs)
-	delReply, ok := delResult.(kvraftapi.DeleteReply)
+	delReply, ok := delResult.(kvapi.DeleteReply)
 	if !ok {
 		t.Fatalf("❌ Delete 返回类型错误，期望 DeleteReply，收到 %T", delResult)
 	}
-	if delReply.Err != kvraftapi.OK {
+	if delReply.Err != kvapi.OK {
 		t.Fatalf("❌ Delete 失败，Err=%v", delReply.Err)
 	}
 
@@ -407,13 +407,13 @@ func TestTTLVisibleAndExpireDelete(t *testing.T) {
 		stats: &ServerStats{},
 	}
 
-	put := kv.DoOp(&kvraftapi.PutArgs{Key: "ttl-key", Value: "v", Version: 0, TTL: 2}).(kvraftapi.PutReply)
-	if put.Err != kvraftapi.OK {
+	put := kv.DoOp(&kvapi.PutArgs{Key: "ttl-key", Value: "v", Version: 0, TTL: 2}).(kvapi.PutReply)
+	if put.Err != kvapi.OK {
 		t.Fatalf("put with ttl failed: %v", put.Err)
 	}
 
-	getBefore := kv.DoOp(&kvraftapi.GetArgs{Key: "ttl-key"}).(kvraftapi.GetReply)
-	if getBefore.Err != kvraftapi.OK {
+	getBefore := kv.DoOp(&kvapi.GetArgs{Key: "ttl-key"}).(kvapi.GetReply)
+	if getBefore.Err != kvapi.OK {
 		t.Fatalf("get before expire failed: %v", getBefore.Err)
 	}
 	if getBefore.Expires <= time.Now().UnixNano() {
@@ -422,8 +422,8 @@ func TestTTLVisibleAndExpireDelete(t *testing.T) {
 
 	time.Sleep(2300 * time.Millisecond)
 
-	getAfter := kv.DoOp(&kvraftapi.GetArgs{Key: "ttl-key"}).(kvraftapi.GetReply)
-	if getAfter.Err != kvraftapi.ErrNoKey {
+	getAfter := kv.DoOp(&kvapi.GetArgs{Key: "ttl-key"}).(kvapi.GetReply)
+	if getAfter.Err != kvapi.ErrNoKey {
 		t.Fatalf("expected ErrNoKey after ttl expiry, got=%v", getAfter.Err)
 	}
 
@@ -431,8 +431,8 @@ func TestTTLVisibleAndExpireDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetExpiredKeys failed: %v", err)
 	}
-	exp := kv.DoOp(&kvraftapi.ExpireArgs{Keys: keys, Cutoff: time.Now().UnixNano()}).(kvraftapi.ExpireReply)
-	if exp.Err != kvraftapi.OK {
+	exp := kv.DoOp(&kvapi.ExpireArgs{Keys: keys, Cutoff: time.Now().UnixNano()}).(kvapi.ExpireReply)
+	if exp.Err != kvapi.OK {
 		t.Fatalf("expire apply failed: %v", exp.Err)
 	}
 
@@ -466,7 +466,7 @@ func TestWatchExpireEventOldValue(t *testing.T) {
 	}
 
 	const key = "expire_watch_key"
-	if putRes := kv.DoOp(&kvraftapi.PutArgs{Key: key, Value: "will-expire", Version: 0, TTL: 1}); putRes.(kvraftapi.PutReply).Err != kvraftapi.OK {
+	if putRes := kv.DoOp(&kvapi.PutArgs{Key: key, Value: "will-expire", Version: 0, TTL: 1}); putRes.(kvapi.PutReply).Err != kvapi.OK {
 		t.Fatalf("❌ 预置数据失败")
 	}
 
@@ -484,9 +484,9 @@ func TestWatchExpireEventOldValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetExpiredKeys failed: %v", err)
 	}
-	expArgs := &kvraftapi.ExpireArgs{Keys: keys, Cutoff: now}
-	expReply := kv.DoOp(expArgs).(kvraftapi.ExpireReply)
-	if expReply.Err != kvraftapi.OK {
+	expArgs := &kvapi.ExpireArgs{Keys: keys, Cutoff: now}
+	expReply := kv.DoOp(expArgs).(kvapi.ExpireReply)
+	if expReply.Err != kvapi.OK {
 		t.Fatalf("expire apply failed: %v", expReply.Err)
 	}
 	kv.OnOpComplete(expArgs, expReply, 3)

@@ -12,26 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"kvraft/pkg/kv"
 	"kvraft/pkg/raft"
-	kvraftapi "kvraft/pkg/raftapi"
 	"kvraft/pkg/wal"
 	"kvraft/pkg/watch"
 )
-
-var useRaftStateMachine bool // 用于选择另一个 Raft 实现（未使用）
-
-type Persister interface {
-	ReadRaftState() []byte
-	ReadHardState() []byte
-	ReadSnapshot() []byte
-	EnqueueSave(raftstate []byte, snapshot []byte) <-chan error
-	EnqueueAppendRaftState(data []byte) <-chan error
-	EnqueueSaveHardState(hardstate []byte) <-chan error
-	Save(raftstate []byte, snapshot []byte)
-	AppendRaftState(data []byte)
-	SaveHardState(hardstate []byte)
-	RaftStateSize() int
-}
 
 type Op struct {
 	Me  int   // 发起请求的服务器 id
@@ -79,8 +64,8 @@ type ApplyLoopPerfStats struct {
 type RSM struct {
 	mu            sync.Mutex
 	me            int
-	rf            kvraftapi.Raft
-	applyCh       chan kvraftapi.ApplyMsg
+	rf            raft.Node
+	applyCh       chan raft.ApplyMsg
 	maxraftstate  int // 当 Raft 日志大小超过此值时触发快照
 	sm            StateMachine
 	persister     raft.Persister
@@ -168,14 +153,14 @@ func (rsm *RSM) Close() {
 func MakeRSM(
 	peers []string, // Raft 集群中各节点的网络地址
 	me int, // 当前节点在 peers 中的下标
-	persister Persister, // 用于持久化 Raft 状态和快照的存储器
+	persister raft.Persister, // 用于持久化 Raft 状态和快照的存储器
 	maxraftstate int, // 当 Raft 日志大小达到此值时触发快照（-1 表示不启用快照）
 	sm StateMachine, // 应用层实现的状态机
 ) *RSM {
 	rsm := &RSM{
 		me:           me,
 		maxraftstate: maxraftstate,
-		applyCh:      make(chan kvraftapi.ApplyMsg),
+		applyCh:      make(chan raft.ApplyMsg),
 		sm:           sm,
 		persister:    persister,
 		idCounter:    0,
@@ -234,7 +219,7 @@ func (rsm *RSM) genID() int64 {
 	return atomic.AddInt64(&rsm.idCounter, 1)
 }
 
-func (rsm *RSM) Raft() kvraftapi.Raft {
+func (rsm *RSM) Raft() raft.Node {
 	return rsm.rf
 }
 
@@ -243,13 +228,13 @@ func (rsm *RSM) EnableLeaseRead(enable bool) {
 }
 
 // SubmitLeaseRead tries local lease read first, then falls back to consensus path.
-func (rsm *RSM) SubmitLeaseRead(req any) (kvraftapi.Err, any) {
+func (rsm *RSM) SubmitLeaseRead(req any) (kv.Err, any) {
 	err, ret, _ := rsm.SubmitLeaseReadWithMode(req)
 	return err, ret
 }
 
 // SubmitLeaseReadWithMode returns whether the request was served via local lease read.
-func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kvraftapi.Err, any, bool) {
+func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kv.Err, any, bool) {
 	// 检查是否开启租约功能
 	if !rsm.leaseRead.Load() {
 		err, ret := rsm.Submit(req)
@@ -264,10 +249,24 @@ func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kvraftapi.Err, any, bool) {
 	// 在租约期内直接读取本地数据
 	if rfImpl.IsLeaderWithLease() {
 		result := rsm.sm.DoOp(req)
-		return kvraftapi.OK, result, true
+		return kv.OK, result, true
 	}
 	err, ret := rsm.Submit(req)
 	return err, ret, false
+}
+
+// reqPtr normalizes a request value to its pointer form for uniform type switching.
+// If v is already *T, returns it as-is; if v is T, returns &v.
+// Returns nil if v is neither T nor *T.
+func reqPtr[T any](v any) *T {
+	switch t := v.(type) {
+	case T:
+		return &t
+	case *T:
+		return t
+	default:
+		return nil
+	}
 }
 
 func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
@@ -278,40 +277,26 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		ReqID:     oper.Id,
 		Timestamp: time.Now().UnixNano(),
 	}
-	switch t := oper.Req.(type) {
-	case *kvraftapi.GetArgs:
+	switch oper.Req.(type) {
+	case *kv.GetArgs, kv.GetArgs:
+		t := reqPtr[kv.GetArgs](oper.Req)
 		entry.OpType = "GET"
 		entry.Key = t.Key
-	case kvraftapi.GetArgs:
-		entry.OpType = "GET"
-		entry.Key = t.Key
-	case *kvraftapi.ScanArgs:
+	case *kv.ScanArgs, kv.ScanArgs:
 		entry.OpType = "SCAN"
-	case kvraftapi.ScanArgs:
-		entry.OpType = "SCAN"
-	case *kvraftapi.PutArgs:
+	case *kv.PutArgs, kv.PutArgs:
+		t := reqPtr[kv.PutArgs](oper.Req)
 		entry.OpType = "PUT"
 		entry.Key = t.Key
 		entry.Value = t.Value
 		entry.Version = int64(t.Version)
 		entry.TTL = t.TTL
-	case kvraftapi.PutArgs:
-		entry.OpType = "PUT"
-		entry.Key = t.Key
-		entry.Value = t.Value
-		entry.Version = int64(t.Version)
-		entry.TTL = t.TTL
-	case *kvraftapi.DeleteArgs:
+	case *kv.DeleteArgs, kv.DeleteArgs:
+		t := reqPtr[kv.DeleteArgs](oper.Req)
 		entry.OpType = "DELETE"
 		entry.Key = t.Key
-	case kvraftapi.DeleteArgs:
-		entry.OpType = "DELETE"
-		entry.Key = t.Key
-	case *kvraftapi.ExpireArgs:
-		entry.OpType = "EXPIRE"
-		entry.Keys = append([]string(nil), t.Keys...)
-		entry.Cutoff = t.Cutoff
-	case kvraftapi.ExpireArgs:
+	case *kv.ExpireArgs, kv.ExpireArgs:
+		t := reqPtr[kv.ExpireArgs](oper.Req)
 		entry.OpType = "EXPIRE"
 		entry.Keys = append([]string(nil), t.Keys...)
 		entry.Cutoff = t.Cutoff
@@ -329,16 +314,16 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 	case "SCAN":
 		return nil, false, nil
 	case "PUT":
-		return &kvraftapi.PutArgs{
+		return &kv.PutArgs{
 			Key:     entry.Key,
 			Value:   entry.Value,
-			Version: kvraftapi.Tversion(entry.Version),
+			Version: kv.Tversion(entry.Version),
 			TTL:     entry.TTL,
 		}, true, nil
 	case "DELETE":
-		return &kvraftapi.DeleteArgs{Key: entry.Key}, true, nil
+		return &kv.DeleteArgs{Key: entry.Key}, true, nil
 	case "EXPIRE":
-		return &kvraftapi.ExpireArgs{
+		return &kv.ExpireArgs{
 			Keys:   append([]string(nil), entry.Keys...),
 			Cutoff: entry.Cutoff,
 		}, true, nil
@@ -429,16 +414,16 @@ func (rsm *RSM) ApplyLoopPerfStatsSnapshot() ApplyLoopPerfStats {
 
 // Submit 向 Raft 提交一条命令并等待其被提交。
 // 如果当前节点不是 Leader，返回 ErrWrongLeader，客户端应重新查找 Leader 后重试。
-func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
+func (rsm *RSM) Submit(req any) (kv.Err, any) {
 	if rsm.shutdown.Load() {
-		return kvraftapi.ErrWrongLeader, nil
+		return kv.ErrWrongLeader, nil
 	}
 
 	opID := rsm.genID()
 	oper := Op{Me: rsm.me, Id: opID, Req: req}
-	index, term, isLeader := rsm.rf.Start(oper)
+	index, _, isLeader := rsm.rf.Start(oper)
 	if !isLeader {
-		return kvraftapi.ErrWrongLeader, nil
+		return kv.ErrWrongLeader, nil
 	}
 	waitingOp := &waitingOp{
 		oper: oper,
@@ -454,30 +439,22 @@ func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
 	rsm.waitingOps[index] = waitingOp
 	rsm.mu.Unlock()
 
-	err, result := func() (kvraftapi.Err, any) {
+	err, result := func() (kv.Err, any) {
 		timer := time.NewTimer(1500 * time.Millisecond)
-		leaderCheck := time.NewTicker(50 * time.Millisecond)
 		defer timer.Stop()
-		defer leaderCheck.Stop()
 		for {
 			if rsm.shutdown.Load() {
-				return kvraftapi.ErrWrongLeader, nil
+				return kv.ErrWrongLeader, nil
 			}
 			select {
 			case <-timer.C:
 				// 超时，返回错误
-				return kvraftapi.ErrWrongLeader, nil
-			case <-leaderCheck.C:
-				currentTerm, stillLeader := rsm.rf.GetState()
-				if !stillLeader || currentTerm != term {
-					// 领导者已经变更
-					return kvraftapi.ErrWrongLeader, nil
-				}
+				return kv.ErrWrongLeader, nil
 			case res := <-waitingOp.done:
 				if res {
-					return kvraftapi.OK, waitingOp.result
+					return kv.OK, waitingOp.result
 				} else {
-					return kvraftapi.ErrWrongLeader, nil
+					return kv.ErrWrongLeader, nil
 				}
 			}
 		}
@@ -525,7 +502,7 @@ func (rsm *RSM) applyLoop() {
 	}
 }
 
-func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
+func (rsm *RSM) applyCommand(msg raft.ApplyMsg) {
 	oper, ok := msg.Command.(Op)
 	if !ok {
 		// 非法的操作类型，忽略
@@ -600,7 +577,7 @@ func (rsm *RSM) shouldCreateSnapshot(commandIndex int) bool {
 	return true
 }
 
-func (rsm *RSM) applySnapshot(msg kvraftapi.ApplyMsg) {
+func (rsm *RSM) applySnapshot(msg raft.ApplyMsg) {
 	if rsm.shutdown.Load() {
 		return
 	}

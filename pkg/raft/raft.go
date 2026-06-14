@@ -1,12 +1,11 @@
 package raft
 
-// 文件 raftapi/raft.go 定义了 Raft 必须向服务器（或测试器）
-// 暴露的接口，但请查看下面每个函数的注释以获取详细说明。
-//
-// Make() 用于创建一个实现了 Raft 接口的新 Raft 节点。
+// Package raft implements the Raft consensus protocol.
+// The Node interface (defined in types.go) specifies the methods that
+// a Raft node must expose to the application layer (e.g., KVServer).
+// Make() creates a new Raft node implementing the Node interface.
 
 import (
-	//	"bytes"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
@@ -19,11 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"6.5840/labgob"
-	//	"6.5840/labrpc"
-	raftapi "kvraft/pkg/raftapi"
-	//	tester "6.5840/tester1"
 )
 
 type Persister interface {
@@ -33,6 +27,9 @@ type Persister interface {
 	EnqueueSave(raftstate []byte, snapshot []byte) <-chan error
 	EnqueueAppendRaftState(data []byte) <-chan error
 	EnqueueSaveHardState(hardstate []byte) <-chan error
+	Save(raftstate []byte, snapshot []byte)
+	AppendRaftState(data []byte)
+	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
 
@@ -116,7 +113,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	applyCh chan raftapi.ApplyMsg
+	applyCh chan ApplyMsg
 
 	heartbeatInterval  time.Duration
 	replicateTrigger   chan struct{}
@@ -1214,7 +1211,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Unlock() // 解锁
 
 	// 发送 snapshot
-	rf.applyCh <- raftapi.ApplyMsg{
+	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      snapshotData,
 		SnapshotTerm:  snapshotTerm,
@@ -1546,7 +1543,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) applier() {
 	for rf.killed() == false {
-		var msgs []raftapi.ApplyMsg
+		var msgs []ApplyMsg
 
 		rf.mu.Lock()
 
@@ -1570,7 +1567,7 @@ func (rf *Raft) applier() {
 			}
 
 			command := rf.log[pos].Command
-			msgs = append(msgs, raftapi.ApplyMsg{
+			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
 				Command:      command,
 				CommandIndex: index,
@@ -1584,7 +1581,6 @@ func (rf *Raft) applier() {
 			rf.applyCh <- msg
 		}
 
-		time.Sleep(1 * time.Millisecond) // 降低提交到状态机的额外等待
 	}
 }
 
@@ -1597,7 +1593,7 @@ func (rf *Raft) applier() {
 // applyCh 是一个通道，Raft 会通过它向测试器或服务发送 ApplyMsg。
 // Make() 必须快速返回，因此应为任何长期运行的任务启动 goroutine。
 func Make(peers []string, me int,
-	persister Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+	persister Persister, applyCh chan ApplyMsg) Node {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister

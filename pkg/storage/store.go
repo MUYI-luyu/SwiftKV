@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
@@ -20,7 +19,6 @@ type kvEntry struct {
 
 // Store 是基于BadgerDB的持久化存储实现
 type Store struct {
-	mu     sync.RWMutex
 	db     *badger.DB
 	dbPath string
 }
@@ -64,9 +62,6 @@ func NewStore(dbPath string) (*Store, error) {
 
 // Get 返回一个键的值、版本号和绝对过期时间戳。
 func (s *Store) Get(key string) (value string, version uint64, expires int64, exists bool, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	err = s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(key))
 		if err == badger.ErrKeyNotFound {
@@ -98,9 +93,6 @@ func (s *Store) Get(key string) (value string, version uint64, expires int64, ex
 
 // Put stores key/value/version with optional absolute expiry unix nano.
 func (s *Store) Put(key, value string, version uint64, expires int64) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	entry := kvEntry{
 		Value:   value,
 		Version: version,
@@ -119,9 +111,6 @@ func (s *Store) Put(key, value string, version uint64, expires int64) error {
 
 // PutCASWithTTL performs version-check and write in a single transaction.
 func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires int64) (oldValue string, status PutCASStatus, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	status = PutCASOK
 	err = s.db.Update(func(txn *badger.Txn) error {
 		item, getErr := txn.Get([]byte(key))
@@ -184,9 +173,6 @@ func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires
 
 // GetExpiredKeys 返回所有过期时间 <= cutoff 阀值的键。
 func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	if limit <= 0 {
 		limit = 128
 	}
@@ -221,9 +207,6 @@ func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
 
 // Delete 从存储中删除一个键
 func (s *Store) Delete(key string) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
@@ -231,9 +214,6 @@ func (s *Store) Delete(key string) error {
 
 // GetAll 获取所有键值对（用于加载快照或导出）
 func (s *Store) GetAll() (map[string]kvEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	data := make(map[string]kvEntry)
 
 	err := s.db.View(func(txn *badger.Txn) error {
@@ -309,9 +289,6 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("关闭临时恢复数据库失败: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// 关闭当前正在运行的旧数据库
 	if s.db != nil {
 		if err := s.db.Close(); err != nil {
@@ -368,9 +345,6 @@ func (s *Store) SaveSnapshot() ([]byte, error) {
 
 // Close 关闭数据库连接
 func (s *Store) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.db != nil {
 		return s.db.Close()
 	}
@@ -384,9 +358,6 @@ func (s *Store) GetStats() string {
 
 // Clear 清空所有数据（用于测试）
 func (s *Store) Clear() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	return s.db.DropAll()
 }
 

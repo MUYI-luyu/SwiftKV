@@ -15,7 +15,8 @@ import (
 	"sync"
 	"time"
 
-	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/kv"
+	"kvraft/pkg/raft"
 	"kvraft/pkg/rsm"
 	"kvraft/pkg/sharding"
 )
@@ -208,7 +209,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		fmt.Print("启动 KVraft 集群...")
 		// 每次压测前清理旧数据，避免历史版本导致初始化阶段大量 ErrVersion。
 		cleanBenchmarkDataDirs(servers)
-		persisters := make([]rsm.Persister, cfg.Servers)
+		persisters := make([]raft.Persister, cfg.Servers)
 
 		for i := 0; i < cfg.Servers; i++ {
 			p, err := rsm.NewFilePersister(benchmarkDataDir(servers[i]))
@@ -245,7 +246,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			}
 			for i := 0; i < probe; i++ {
 				_, _, _, e := seedCheckClerk.Get(fmt.Sprintf("key-%d", i))
-				if e != kvraftapi.OK {
+				if e != kv.OK {
 					allSeeded = false
 					break
 				}
@@ -297,9 +298,9 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 					key := fmt.Sprintf("key-%d", i)
 					value := fmt.Sprintf("value-%d", i)
 					errCode := c.Put(key, value, 0)
-					if errCode == kvraftapi.OK {
+					if errCode == kv.OK {
 						localOK++
-					} else if errCode == kvraftapi.ErrVersion {
+					} else if errCode == kv.ErrVersion {
 						// 历史数据已存在时视作预热成功。
 						localOK++
 						localVersionConflict++
@@ -392,7 +393,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 				key := fmt.Sprintf("key-%d", r.Intn(cfg.Keys))
 				opStart := time.Now()
-				var errCode kvraftapi.Err
+				var errCode kv.Err
 
 				if r.Float64() < cfg.ReadRatio {
 					_, _, _, errCode = workerClerk.Get(key)
@@ -400,17 +401,17 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
 					_, version, _, getErr := workerClerk.Get(key)
-					if getErr == kvraftapi.OK {
+					if getErr == kv.OK {
 						errCode = workerClerk.Put(key, value, version)
-					} else if getErr == kvraftapi.ErrNoKey {
+					} else if getErr == kv.ErrNoKey {
 						errCode = workerClerk.Put(key, value, 0)
 					} else {
 						errCode = getErr
 					}
 					localWrite++
-					if errCode == kvraftapi.OK {
+					if errCode == kv.OK {
 						localWriteOK++
-					} else if errCode == kvraftapi.ErrVersion {
+					} else if errCode == kv.ErrVersion {
 						localWriteConflicts++
 					}
 				}
@@ -426,7 +427,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 				}
 				localLatencyValues = append(localLatencyValues, latency.Nanoseconds())
 
-				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey || errCode == kvraftapi.ErrVersion {
+				if errCode == kv.OK || errCode == kv.ErrNoKey || errCode == kv.ErrVersion {
 					localSuccess++
 				} else {
 					localFailed++

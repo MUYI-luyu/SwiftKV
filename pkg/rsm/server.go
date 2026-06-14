@@ -2,8 +2,8 @@ package rsm
 
 import (
 	"encoding/gob"
+	kvapi "kvraft/pkg/kv"
 	"kvraft/pkg/raft"
-	kvraftapi "kvraft/pkg/raftapi"
 	"kvraft/pkg/storage"
 	"kvraft/pkg/watch"
 	"log"
@@ -34,15 +34,15 @@ func absoluteExpiryFromTTL(ttlSeconds int64, now int64) int64 {
 // KVServer - 高性能分布式键值存储服务器
 
 type OperationInfo struct {
-	Type       string        // 操作类型：GET、PUT、DELETE、SCAN、EXPIRE 等
-	Key        string        // 操作的键名
-	OldValue   string        // 操作执行前的值
-	NewValue   string        // 操作执行后的值
-	OldVersion int64         // 操作执行前的版本号
-	NewVersion int64         // 操作执行后的版本号
-	Timestamp  time.Time     // 操作的时间戳
-	Success    bool          // 操作是否执行成功
-	Error      kvraftapi.Err // 操作的错误码
+	Type       string    // 操作类型：GET、PUT、DELETE、SCAN、EXPIRE 等
+	Key        string    // 操作的键名
+	OldValue   string    // 操作执行前的值
+	NewValue   string    // 操作执行后的值
+	OldVersion int64     // 操作执行前的版本号
+	NewVersion int64     // 操作执行后的版本号
+	Timestamp  time.Time // 操作的时间戳
+	Success    bool      // 操作是否执行成功
+	Error      kvapi.Err // 操作的错误码
 }
 
 type KVServer struct {
@@ -98,37 +98,27 @@ type RuntimePerfStats struct {
 // 核心业务逻辑 - Do Op (执行状态机操作)
 
 func (kv *KVServer) DoOp(req any) any {
-	switch t := req.(type) {
-	case *kvraftapi.GetArgs:
-		return kv.doGet(t)
-	case kvraftapi.GetArgs:
-		return kv.doGet(&t)
-	case *kvraftapi.PutArgs:
-		return kv.doPut(t)
-	case kvraftapi.PutArgs:
-		return kv.doPut(&t)
-	case *kvraftapi.DeleteArgs:
-		return kv.doDelete(t)
-	case kvraftapi.DeleteArgs:
-		return kv.doDelete(&t)
-	case *kvraftapi.ScanArgs:
-		return kv.doScan(t)
-	case kvraftapi.ScanArgs:
-		return kv.doScan(&t)
-	case *kvraftapi.ExpireArgs:
-		return kv.doExpire(t)
-	case kvraftapi.ExpireArgs:
-		return kv.doExpire(&t)
+	switch req.(type) {
+	case *kvapi.GetArgs, kvapi.GetArgs:
+		return kv.doGet(reqPtr[kvapi.GetArgs](req))
+	case *kvapi.PutArgs, kvapi.PutArgs:
+		return kv.doPut(reqPtr[kvapi.PutArgs](req))
+	case *kvapi.DeleteArgs, kvapi.DeleteArgs:
+		return kv.doDelete(reqPtr[kvapi.DeleteArgs](req))
+	case *kvapi.ScanArgs, kvapi.ScanArgs:
+		return kv.doScan(reqPtr[kvapi.ScanArgs](req))
+	case *kvapi.ExpireArgs, kvapi.ExpireArgs:
+		return kv.doExpire(reqPtr[kvapi.ExpireArgs](req))
 	default:
-		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, t)
-		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, req)
+		return kvapi.GetReply{Err: kvapi.ErrWrongLeader}
 	}
 }
 
 // doGet - 直接从 BadgerDB 读取（其 BlockCache 提供缓存功能）
-func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
+func (kv *KVServer) doGet(args *kvapi.GetArgs) kvapi.GetReply {
 	if kv.killed() {
-		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.GetReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	// 存储查询（BadgerDB 的 BlockCache 会处理热数据缓存）
@@ -137,25 +127,25 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error: %v", kv.me, err)
 		kv.stats.RecordFailure()
-		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.GetReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	if exists && !isExpired(expires, now) {
-		return kvraftapi.GetReply{
+		return kvapi.GetReply{
 			Value:   value,
-			Version: kvraftapi.Tversion(version),
+			Version: kvapi.Tversion(version),
 			Expires: expires,
-			Err:     kvraftapi.OK,
+			Err:     kvapi.OK,
 		}
 	}
 
-	return kvraftapi.GetReply{Err: kvraftapi.ErrNoKey}
+	return kvapi.GetReply{Err: kvapi.ErrNoKey}
 }
 
 // doPut - 写操作：更新缓存和存储
-func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
+func (kv *KVServer) doPut(args *kvapi.PutArgs) kvapi.PutReply {
 	if kv.killed() {
-		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.PutReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	now := time.Now().UnixNano()
@@ -165,28 +155,28 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 	if err != nil {
 		log.Printf("[KVServer-%d] Put error: %v", kv.me, err)
 		kv.stats.RecordFailure()
-		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.PutReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	switch status {
 	case storage.PutCASOK:
 		kv.stats.RecordWrite()
-		return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: oldValue}
+		return kvapi.PutReply{Err: kvapi.OK, OldValue: oldValue}
 	case storage.PutCASVersionMismatch:
 		kv.stats.RecordFailure()
-		return kvraftapi.PutReply{Err: kvraftapi.ErrVersion}
+		return kvapi.PutReply{Err: kvapi.ErrVersion}
 	case storage.PutCASNoKey:
 		kv.stats.RecordFailure()
-		return kvraftapi.PutReply{Err: kvraftapi.ErrNoKey}
+		return kvapi.PutReply{Err: kvapi.ErrNoKey}
 	default:
 		kv.stats.RecordFailure()
-		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.PutReply{Err: kvapi.ErrWrongLeader}
 	}
 }
 
-func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
+func (kv *KVServer) doDelete(args *kvapi.DeleteArgs) kvapi.DeleteReply {
 	if kv.killed() {
-		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.DeleteReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	now := time.Now().UnixNano()
@@ -194,35 +184,35 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Delete: %v", kv.me, err)
 		kv.stats.RecordFailure()
-		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.DeleteReply{Err: kvapi.ErrWrongLeader}
 	}
 	if exists && isExpired(expires, now) {
 		exists = false
 	}
 	if !exists {
-		return kvraftapi.DeleteReply{Err: kvraftapi.ErrNoKey}
+		return kvapi.DeleteReply{Err: kvapi.ErrNoKey}
 	}
 
 	if err := kv.store.Delete(args.Key); err != nil {
 		log.Printf("[KVServer-%d] Delete error: %v", kv.me, err)
 		kv.stats.RecordFailure()
-		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.DeleteReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	kv.stats.RecordWrite()
-	return kvraftapi.DeleteReply{Err: kvraftapi.OK, OldValue: oldValue}
+	return kvapi.DeleteReply{Err: kvapi.OK, OldValue: oldValue}
 }
 
-func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
+func (kv *KVServer) doScan(args *kvapi.ScanArgs) kvapi.ScanReply {
 	if kv.killed() {
-		return kvraftapi.ScanReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.ScanReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	all, err := kv.store.GetAll()
 	if err != nil {
 		log.Printf("[KVServer-%d] Scan GetAll error: %v", kv.me, err)
 		kv.stats.RecordFailure()
-		return kvraftapi.ScanReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.ScanReply{Err: kvapi.ErrWrongLeader}
 	}
 
 	keys := make([]string, 0, len(all))
@@ -238,7 +228,7 @@ func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
 		limit = len(keys)
 	}
 
-	items := make([]kvraftapi.ScanItem, 0, limit)
+	items := make([]kvapi.ScanItem, 0, limit)
 	for i := 0; i < limit; i++ {
 		k := keys[i]
 		v := all[k]
@@ -246,10 +236,10 @@ func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
 		if isExpired(v.Expires, now) {
 			continue
 		}
-		items = append(items, kvraftapi.ScanItem{
+		items = append(items, kvapi.ScanItem{
 			Key:     k,
 			Value:   v.Value,
-			Version: kvraftapi.Tversion(v.Version),
+			Version: kvapi.Tversion(v.Version),
 			Expires: v.Expires,
 		})
 		if len(items) >= limit {
@@ -257,15 +247,15 @@ func (kv *KVServer) doScan(args *kvraftapi.ScanArgs) kvraftapi.ScanReply {
 		}
 	}
 
-	return kvraftapi.ScanReply{Items: items, Err: kvraftapi.OK}
+	return kvapi.ScanReply{Items: items, Err: kvapi.OK}
 }
 
-func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
+func (kv *KVServer) doExpire(args *kvapi.ExpireArgs) kvapi.ExpireReply {
 	if kv.killed() {
-		return kvraftapi.ExpireReply{Err: kvraftapi.ErrWrongLeader}
+		return kvapi.ExpireReply{Err: kvapi.ErrWrongLeader}
 	}
 	if len(args.Keys) == 0 {
-		return kvraftapi.ExpireReply{Err: kvraftapi.OK}
+		return kvapi.ExpireReply{Err: kvapi.OK}
 	}
 
 	expired := make([]string, 0, len(args.Keys))
@@ -287,7 +277,7 @@ func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
 	if len(expired) > 0 {
 		kv.stats.RecordTTLExpired(int64(len(expired)))
 	}
-	return kvraftapi.ExpireReply{ExpiredKeys: expired, ExpiredOldValues: expiredOldValues, Err: kvraftapi.OK}
+	return kvapi.ExpireReply{ExpiredKeys: expired, ExpiredOldValues: expiredOldValues, Err: kvapi.OK}
 }
 
 // 快照管理
@@ -330,29 +320,23 @@ func (kv *KVServer) OnOpComplete(req any, result any, index int64) {
 		return
 	}
 
-	switch t := req.(type) {
-	case *kvraftapi.PutArgs:
-		kv.notifyPutEvent(t, result, watchMgr)
-	case kvraftapi.PutArgs:
-		kv.notifyPutEvent(&t, result, watchMgr)
-	case *kvraftapi.DeleteArgs:
-		kv.notifyDeleteEvent(t, result, watchMgr)
-	case kvraftapi.DeleteArgs:
-		kv.notifyDeleteEvent(&t, result, watchMgr)
-	case *kvraftapi.ExpireArgs:
-		kv.notifyExpireEvent(t, result, watchMgr)
-	case kvraftapi.ExpireArgs:
-		kv.notifyExpireEvent(&t, result, watchMgr)
+	switch req.(type) {
+	case *kvapi.PutArgs, kvapi.PutArgs:
+		kv.notifyPutEvent(reqPtr[kvapi.PutArgs](req), result, watchMgr)
+	case *kvapi.DeleteArgs, kvapi.DeleteArgs:
+		kv.notifyDeleteEvent(reqPtr[kvapi.DeleteArgs](req), result, watchMgr)
+	case *kvapi.ExpireArgs, kvapi.ExpireArgs:
+		kv.notifyExpireEvent(reqPtr[kvapi.ExpireArgs](req), result, watchMgr)
 	}
 }
 
-func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watchMgr *watch.Manager) {
-	putReply, ok := result.(kvraftapi.PutReply)
+func (kv *KVServer) notifyPutEvent(putArgs *kvapi.PutArgs, result any, watchMgr *watch.Manager) {
+	putReply, ok := result.(kvapi.PutReply)
 	if !ok {
 		return
 	}
 
-	if putReply.Err == kvraftapi.OK {
+	if putReply.Err == kvapi.OK {
 		// 从PutReply中直接获取OldValue，避免在Put后再次读取导致获取到新值的问题
 		oldValueStr := putReply.OldValue
 
@@ -376,12 +360,12 @@ func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watch
 	}
 }
 
-func (kv *KVServer) notifyDeleteEvent(delArgs *kvraftapi.DeleteArgs, result any, watchMgr *watch.Manager) {
-	delReply, ok := result.(kvraftapi.DeleteReply)
+func (kv *KVServer) notifyDeleteEvent(delArgs *kvapi.DeleteArgs, result any, watchMgr *watch.Manager) {
+	delReply, ok := result.(kvapi.DeleteReply)
 	if !ok {
 		return
 	}
-	if delReply.Err != kvraftapi.OK {
+	if delReply.Err != kvapi.OK {
 		return
 	}
 
@@ -397,9 +381,9 @@ func (kv *KVServer) notifyDeleteEvent(delArgs *kvraftapi.DeleteArgs, result any,
 	}
 }
 
-func (kv *KVServer) notifyExpireEvent(_ *kvraftapi.ExpireArgs, result any, watchMgr *watch.Manager) {
-	expReply, ok := result.(kvraftapi.ExpireReply)
-	if !ok || expReply.Err != kvraftapi.OK {
+func (kv *KVServer) notifyExpireEvent(_ *kvapi.ExpireArgs, result any, watchMgr *watch.Manager) {
+	expReply, ok := result.(kvapi.ExpireReply)
+	if !ok || expReply.Err != kvapi.OK {
 		return
 	}
 	for _, key := range expReply.ExpiredKeys {
@@ -514,13 +498,13 @@ func (s *ServerStats) GetStats() (requests, writes, reads, failures int64) {
 }
 
 // 服务器启动
-func StartKVServer(servers []string, gid int, me int, persister Persister, maxraftstate int, address string) *KVServer {
+func StartKVServer(servers []string, gid int, me int, persister raft.Persister, maxraftstate int, address string) *KVServer {
 	gob.Register(Op{})
-	gob.Register(kvraftapi.PutArgs{})
-	gob.Register(kvraftapi.GetArgs{})
-	gob.Register(kvraftapi.DeleteArgs{})
-	gob.Register(kvraftapi.ScanArgs{})
-	gob.Register(kvraftapi.ExpireArgs{})
+	gob.Register(kvapi.PutArgs{})
+	gob.Register(kvapi.GetArgs{})
+	gob.Register(kvapi.DeleteArgs{})
+	gob.Register(kvapi.ScanArgs{})
+	gob.Register(kvapi.ExpireArgs{})
 
 	storePath := filepath.Join(runtimeDataRoot(), "badger-"+address)
 	store, err := storage.NewStore(storePath)
@@ -588,7 +572,7 @@ func (kv *KVServer) ttlCleanupLoop() {
 		if err != nil || len(keys) == 0 {
 			continue
 		}
-		args := &kvraftapi.ExpireArgs{Keys: keys, Cutoff: now}
+		args := &kvapi.ExpireArgs{Keys: keys, Cutoff: now}
 		_, _ = kv.rsm.Submit(args)
 	}
 }

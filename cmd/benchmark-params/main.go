@@ -9,7 +9,8 @@ import (
 	"strings"
 	"time"
 
-	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/kv"
+	"kvraft/pkg/raft"
 	"kvraft/pkg/rsm"
 )
 
@@ -209,7 +210,7 @@ func runBenchmark(params BenchmarkParams, scenario TestScenario) (*BenchResult, 
 	}
 
 	kvServers := make([]*rsm.KVServer, scenario.Servers)
-	persisters := make([]rsm.Persister, scenario.Servers)
+	persisters := make([]raft.Persister, scenario.Servers)
 
 	for i := 0; i < scenario.Servers; i++ {
 		p, err := rsm.NewFilePersister(benchmarkDataDir(servers[i]))
@@ -324,14 +325,14 @@ func runBenchmarkInternal(scenario TestScenario, servers []string) *BenchmarkInt
 				key := fmt.Sprintf("key-%d", r.Intn(100))
 				opStart := time.Now()
 
-				var errCode kvraftapi.Err
+				var errCode kv.Err
 				if r.Float64() < scenario.ReadRatio {
 					_, _, _, errCode = c.Get(key)
 					readOps++
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
 					_, version, _, getErr := c.Get(key)
-					if getErr == kvraftapi.OK {
+					if getErr == kv.OK {
 						errCode = c.Put(key, value, version)
 					} else {
 						errCode = c.Put(key, value, 0)
@@ -351,7 +352,7 @@ func runBenchmarkInternal(scenario TestScenario, servers []string) *BenchmarkInt
 					maxLatency = latency
 				}
 
-				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey || errCode == kvraftapi.ErrVersion {
+				if errCode == kv.OK || errCode == kv.ErrNoKey || errCode == kv.ErrVersion {
 					successOps++
 				} else {
 					failedOps++

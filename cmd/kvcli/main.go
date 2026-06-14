@@ -14,7 +14,7 @@ import (
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
-	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/kv"
 	"kvraft/pkg/rsm"
 	"kvraft/pkg/sharding"
 )
@@ -171,7 +171,7 @@ func main() {
 	var outMu sync.Mutex
 	watchers := map[int]*rsm.WatchSubscription{}
 	nextWatchID := 1
-	localVersion := map[string]kvraftapi.Tversion{}
+	localVersion := map[string]kv.Tversion{}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -206,7 +206,7 @@ func main() {
 				continue
 			}
 			val, ver, expires, e := ck.Get(parts[1])
-			if e == kvraftapi.OK {
+			if e == kv.OK {
 				remainingSec := (expires - time.Now().UnixNano()) / int64(time.Second)
 				if expires > 0 && remainingSec > 0 {
 					fmt.Printf("value=%q version=%d expires=%d (remaining=%ds) err=%s\n", val, ver, expires, remainingSec, e)
@@ -225,7 +225,7 @@ func main() {
 			}
 			key := parts[1]
 			value := parts[2]
-			var version kvraftapi.Tversion
+			var version kv.Tversion
 			explicitVersion := false
 			if len(parts) == 4 {
 				v, parseErr := strconv.ParseInt(parts[3], 10, 64)
@@ -233,16 +233,16 @@ func main() {
 					fmt.Printf("invalid version: %v\n", parseErr)
 					continue
 				}
-				version = kvraftapi.Tversion(v)
+				version = kv.Tversion(v)
 				explicitVersion = true
 			} else {
 				if v, ok := localVersion[key]; ok {
 					version = v
 				} else {
 					_, ver, _, gerr := ck.Get(key)
-					if gerr == kvraftapi.OK {
+					if gerr == kv.OK {
 						version = ver
-					} else if gerr == kvraftapi.ErrNoKey {
+					} else if gerr == kv.ErrNoKey {
 						version = 0
 					} else {
 						fmt.Printf("cannot determine version automatically: %v\n", gerr)
@@ -261,7 +261,7 @@ func main() {
 			for {
 				attempts++
 				errCode := ck.Put(key, value, version)
-				if errCode == kvraftapi.OK {
+				if errCode == kv.OK {
 					localVersion[key] = version + 1
 					if attempts == 1 {
 						fmt.Printf("put err=%s\n", errCode)
@@ -271,15 +271,15 @@ func main() {
 					break
 				}
 
-				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe && errCode != kvraftapi.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
+				if explicitVersion || (errCode != kv.ErrVersion && errCode != kv.ErrMaybe && errCode != kv.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
 					fmt.Printf("put err=%s\n", errCode)
 					break
 				}
 
 				_, ver, _, gerr := ck.Get(key)
-				if gerr == kvraftapi.OK {
+				if gerr == kv.OK {
 					version = ver
-				} else if gerr == kvraftapi.ErrNoKey {
+				} else if gerr == kv.ErrNoKey {
 					version = 0
 				} else {
 					fmt.Printf("put err=%s (refresh failed: %v)\n", errCode, gerr)
@@ -301,7 +301,7 @@ func main() {
 				continue
 			}
 
-			var version kvraftapi.Tversion
+			var version kv.Tversion
 			explicitVersion := false
 			if len(parts) == 5 {
 				v, parseErr := strconv.ParseInt(parts[4], 10, 64)
@@ -309,16 +309,16 @@ func main() {
 					fmt.Printf("invalid version: %v\n", parseErr)
 					continue
 				}
-				version = kvraftapi.Tversion(v)
+				version = kv.Tversion(v)
 				explicitVersion = true
 			} else {
 				if v, ok := localVersion[key]; ok {
 					version = v
 				} else {
 					_, ver, _, gerr := ck.Get(key)
-					if gerr == kvraftapi.OK {
+					if gerr == kv.OK {
 						version = ver
-					} else if gerr == kvraftapi.ErrNoKey {
+					} else if gerr == kv.ErrNoKey {
 						version = 0
 					} else {
 						fmt.Printf("cannot determine version automatically: %v\n", gerr)
@@ -337,7 +337,7 @@ func main() {
 			for {
 				attempts++
 				errCode := ck.PutWithTTL(key, value, version, ttlSeconds)
-				if errCode == kvraftapi.OK {
+				if errCode == kv.OK {
 					localVersion[key] = version + 1
 					if attempts == 1 {
 						fmt.Printf("put-ttl err=%s ttl=%ds\n", errCode, ttlSeconds)
@@ -347,15 +347,15 @@ func main() {
 					break
 				}
 
-				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe && errCode != kvraftapi.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
+				if explicitVersion || (errCode != kv.ErrVersion && errCode != kv.ErrMaybe && errCode != kv.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
 					fmt.Printf("put-ttl err=%s\n", errCode)
 					break
 				}
 
 				_, ver, _, gerr := ck.Get(key)
-				if gerr == kvraftapi.OK {
+				if gerr == kv.OK {
 					version = ver
-				} else if gerr == kvraftapi.ErrNoKey {
+				} else if gerr == kv.ErrNoKey {
 					version = 0
 				} else {
 					fmt.Printf("put-ttl err=%s (refresh failed: %v)\n", errCode, gerr)
@@ -371,7 +371,7 @@ func main() {
 			}
 			key := parts[1]
 			errCode := ck.Delete(key)
-			if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey {
+			if errCode == kv.OK || errCode == kv.ErrNoKey {
 				delete(localVersion, key)
 			}
 			fmt.Printf("delete err=%s\n", errCode)
@@ -390,7 +390,7 @@ func main() {
 				limit = l
 			}
 			items, e := ck.Scan(parts[1], limit)
-			if e != kvraftapi.OK {
+			if e != kv.OK {
 				fmt.Printf("scan err=%s\n", e)
 				continue
 			}

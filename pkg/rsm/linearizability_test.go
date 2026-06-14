@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	kvraftapi "kvraft/pkg/raftapi"
+	kvapi "kvraft/pkg/kv"
 	"kvraft/pkg/storage"
 )
 
@@ -20,12 +20,12 @@ type linearOp struct {
 	Type         string
 	Key          string
 	Value        string
-	PutVersion   kvraftapi.Tversion
+	PutVersion   kvapi.Tversion
 	InvokeTime   time.Time
 	ResponseTime time.Time
-	Err          kvraftapi.Err
+	Err          kvapi.Err
 	GetValue     string
-	GetVersion   kvraftapi.Tversion
+	GetVersion   kvapi.Tversion
 }
 
 type linearizabilityConfig struct {
@@ -109,7 +109,7 @@ func runOneOperation(kv *KVServer, cfg *linearizabilityConfig, r *rand.Rand, cli
 	opType := randomOpType(r)
 	key := randomKey(r, cfg.KeySpace)
 	value := randomValue(r)
-	putVersion := kvraftapi.Tversion(r.Intn(6))
+	putVersion := kvapi.Tversion(r.Intn(6))
 
 	op := &linearOp{
 		ID:         id,
@@ -127,15 +127,15 @@ func runOneOperation(kv *KVServer, cfg *linearizabilityConfig, r *rand.Rand, cli
 
 	switch opType {
 	case "get":
-		reply := kv.DoOp(&kvraftapi.GetArgs{Key: key}).(kvraftapi.GetReply)
+		reply := kv.DoOp(&kvapi.GetArgs{Key: key}).(kvapi.GetReply)
 		op.Err = reply.Err
 		op.GetValue = reply.Value
 		op.GetVersion = reply.Version
 	case "put":
-		reply := kv.DoOp(&kvraftapi.PutArgs{Key: key, Value: value, Version: putVersion}).(kvraftapi.PutReply)
+		reply := kv.DoOp(&kvapi.PutArgs{Key: key, Value: value, Version: putVersion}).(kvapi.PutReply)
 		op.Err = reply.Err
 	case "delete":
-		reply := kv.DoOp(&kvraftapi.DeleteArgs{Key: key}).(kvraftapi.DeleteReply)
+		reply := kv.DoOp(&kvapi.DeleteArgs{Key: key}).(kvapi.DeleteReply)
 		op.Err = reply.Err
 	}
 
@@ -155,7 +155,7 @@ func checkLinearizabilityWithOracle(ops []*linearOp) (bool, []string) {
 	// Oracle: 内存中的逻辑状态机（key -> value/version）。
 	type state struct {
 		Value   string
-		Version kvraftapi.Tversion
+		Version kvapi.Tversion
 	}
 	oracle := make(map[string]state)
 	violations := make([]string, 0)
@@ -165,7 +165,7 @@ func checkLinearizabilityWithOracle(ops []*linearOp) (bool, []string) {
 
 		switch op.Type {
 		case "get":
-			if op.Err == kvraftapi.OK {
+			if op.Err == kvapi.OK {
 				if !exists {
 					violations = append(violations, fmt.Sprintf("get(%s)=OK but oracle has no key", op.Key))
 					continue
@@ -175,14 +175,14 @@ func checkLinearizabilityWithOracle(ops []*linearOp) (bool, []string) {
 						fmt.Sprintf("get(%s) mismatch: got=(%q,v=%d), oracle=(%q,v=%d)",
 							op.Key, op.GetValue, op.GetVersion, s.Value, s.Version))
 				}
-			} else if op.Err == kvraftapi.ErrNoKey {
+			} else if op.Err == kvapi.ErrNoKey {
 				if exists {
 					violations = append(violations, fmt.Sprintf("get(%s)=ErrNoKey but oracle has key", op.Key))
 				}
 			}
 		case "put":
-			if op.Err == kvraftapi.OK {
-				expected := kvraftapi.Tversion(0)
+			if op.Err == kvapi.OK {
+				expected := kvapi.Tversion(0)
 				if exists {
 					expected = s.Version
 				}
@@ -194,7 +194,7 @@ func checkLinearizabilityWithOracle(ops []*linearOp) (bool, []string) {
 				oracle[op.Key] = state{Value: op.Value, Version: expected + 1}
 			}
 		case "delete":
-			if op.Err == kvraftapi.OK {
+			if op.Err == kvapi.OK {
 				if !exists {
 					violations = append(violations, fmt.Sprintf("delete(%s)=OK but oracle has no key", op.Key))
 					continue

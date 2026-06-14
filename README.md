@@ -110,7 +110,7 @@ go run cmd/kvmigrate/main.go --dry-run
 - `pkg/storage/`：BadgerDB 持久化封装
 - `pkg/watch/`：订阅与事件分发
 - `pkg/sharding/`：一致性哈希与路由
-- `pkg/raftapi/`：Raft 与 RSM 接口抽象
+- `pkg/kv/`：KV 业务类型定义（请求/响应结构体、错误码、版本号）
 - `pkg/wal/`：预写日志（WAL）分段管理
 - `api/pb/`：Proto 契约与生成代码
 - `cmd/`：可执行入口（server、kvcli、kvmigrate、benchmarks）
