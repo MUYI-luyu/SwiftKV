@@ -1,10 +1,11 @@
 package sharding
 
 import (
-	"crypto/md5"
 	"fmt"
 	"sort"
 	"sync"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // ConsistentHash 一致性哈希实现
@@ -109,11 +110,9 @@ func (ch *ConsistentHash) GetNodes(key string, count int) []string {
 	return nodes
 }
 
-// hash MD5哈希函数
+// hash 使用 xxhash 进行快速高质量哈希（比 MD5 快约 10x，分布更均匀）
 func (ch *ConsistentHash) hash(key string) uint32 {
-	data := md5.Sum([]byte(key))
-	value := uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
-	return value
+	return uint32(xxhash.Sum64String(key))
 }
 
 // getSortedHashes 获取排序后的哈希值

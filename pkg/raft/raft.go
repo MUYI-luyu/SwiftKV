@@ -88,7 +88,7 @@ type persistedCommandEnvelope struct {
 
 // 实现单个 Raft 节点的 Go 对象。
 type Raft struct {
-	mu        sync.Mutex // 锁，用于保护该节点状态的并发访问
+	mu        sync.RWMutex // 锁，用于保护该节点状态的并发访问
 	peers     []string   // 所有节点的 RPC 端点
 	persister Persister  // 用于保存该节点持久化状态的对象
 	me        int        // 当前节点在 peers[] 中的索引
@@ -108,6 +108,15 @@ type Raft struct {
 	// 所有服务器上的易失性状态
 	CommitIndex int
 	LastApplied int
+
+	// persistedIndex 记录本地磁盘已确认持久化的最高逻辑日志索引。
+	// applier 和 commit 推进均受此字段约束：绝不允许 LastApplied > persistedIndex。
+	// 由异步持久化完成回调、Snapshot() 及启动恢复路径更新，只在 mu 锁内读写。
+	persistedIndex int
+
+	// commitCond 用于在 CommitIndex 或 persistedIndex 推进时唤醒 applier，
+	// 替代原来的 busy-loop 轮询。
+	commitCond *sync.Cond
 
 	//  leader上的易失性状态，在选举之后重新初始化
 	nextIndex  []int
@@ -196,9 +205,15 @@ func (rf *Raft) callPeer(server int, method string, args interface{}, reply inte
 
 // 返回当前任期以及该服务器是否认为自己是领导者。
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.CurrentTerm, rf.state == Leader
+}
+
+func (rf *Raft) GetLastApplied() int {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.LastApplied
 }
 
 func (rf *Raft) lockWithMetrics() {
@@ -321,6 +336,7 @@ func (rf *Raft) SyncAppliedIndex(index int) {
 	}
 	if index > rf.CommitIndex {
 		rf.CommitIndex = index
+		rf.commitCond.Signal()
 	}
 	if index > rf.LastApplied {
 		rf.LastApplied = index
@@ -465,8 +481,13 @@ func (rf *Raft) markPersistV3PersistedLocked(stateLen int, logCount int) {
 	if logCount < 0 {
 		logCount = 0
 	}
-	rf.persistV3PersistedLen = stateLen
-	rf.persistV3PersistedLogCount = logCount
+	// 使用 max 语义防止异步持久化回调乱序到达时覆盖较新的结果
+	if stateLen > rf.persistV3PersistedLen {
+		rf.persistV3PersistedLen = stateLen
+	}
+	if logCount > rf.persistV3PersistedLogCount {
+		rf.persistV3PersistedLogCount = logCount
+	}
 }
 
 func (rf *Raft) markPersistV3QueuedLocked(stateLen int, logCount int) {
@@ -739,8 +760,8 @@ func (rf *Raft) readHardState(data []byte) {
 
 // 返回 Raft 持久化日志的字节数。
 func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.persister.RaftStateSize()
 }
 
@@ -840,8 +861,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.LastApplied = index
 	}
 
-	// 7. 持久化 (状态 + snapshot)
+	// 7. 持久化 (状态 + snapshot) — 同步落盘
 	rf.persist(snapshot)
+
+	// 快照数据已落盘，persistedIndex 至少推进到快照覆盖的 index
+	if index > rf.persistedIndex {
+		rf.persistedIndex = index
+	}
+	rf.commitCond.Signal()
 }
 
 // RequestVote RPC 参数结构体
@@ -1061,8 +1088,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.CommitIndex {
 		// rf.CommitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		rf.CommitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
-		// 可选：应用日志到状态机 ApplyMsg
-		// rf.applyLogEntries()
+		rf.commitCond.Signal()
 	}
 
 	reply.Success = true
@@ -1086,6 +1112,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // 第一个返回值是命令将出现的日志索引（若被提交）。
 // 第二个返回值是当前任期。
 // 第三个返回值表示该服务器是否认为自己是领导者。
+//
+// Start() 将命令追加到内存日志后立即返回，不等待磁盘持久化。
+// 持久化由后台 goroutine 异步完成，安全由 persistedIndex 门控保证：
+//   - applier 绝不会应用 LastApplied > persistedIndex 的条目
+//   - Leader 提交推进时，若条目未持久化则不计入自己的那一票
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.lockWithMetrics()
 
@@ -1100,7 +1131,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := rf.getLastLogIndex() + 1
 	term := rf.CurrentTerm
 
-	// 3. 追加日志（这是 Start 的核心）
+	// 3. 追加日志（内存操作，微秒级）
 	entry := LogEntry{
 		Term:    term,
 		Command: command,
@@ -1108,19 +1139,38 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.markPersistV3DirtyFromLocked(len(rf.log))
 	_ = ensureEntryCommandEncoded(&entry)
 	rf.log = append(rf.log, entry)
+
+	// 4. 入队持久化，但不等待磁盘完成
 	persistDone, persistStateLen, persistLogCount := rf.enqueuePersistLocked(nil)
+	// 本次持久化期望覆盖的最高逻辑索引
+	coveredIndex := rf.lastIncludedIndex + persistLogCount - 1
 	rf.mu.Unlock()
 
-	err := rf.waitPersistDone(persistDone)
-	rf.commitPersistResult(persistStateLen, persistLogCount, err)
+	// 5. 异步 goroutine：等待磁盘 I/O 完成后更新 persistedIndex
+	go rf.completePersistAsync(persistDone, persistStateLen, persistLogCount, coveredIndex)
 
-	// 新日志到达时触发一次快速复制，避免每次 Start 都创建复制 goroutine。
+	// 6. 触发网络复制（不阻塞）
 	select {
 	case rf.replicateTrigger <- struct{}{}:
 	default:
 	}
-	// 4. 立即返回（不等提交）
+	// 7. 立即返回（不等提交，不等持久化）
 	return index, term, true
+}
+
+// completePersistAsync 是 Start() 的异步持久化回调。
+// 当磁盘 I/O 完成后，更新 persistedIndex 并唤醒 applier。
+func (rf *Raft) completePersistAsync(persistDone <-chan error, stateLen, logCount, coveredIndex int) {
+	err := rf.waitPersistDone(persistDone)
+	if err == nil {
+		rf.mu.Lock()
+		if coveredIndex > rf.persistedIndex {
+			rf.persistedIndex = coveredIndex
+		}
+		rf.commitCond.Signal()
+		rf.mu.Unlock()
+	}
+	rf.commitPersistResult(stateLen, logCount, err)
 }
 
 // 测试器不会在每次测试结束后停止 Raft 创建的 goroutine，
@@ -1202,6 +1252,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.LastApplied = max(rf.LastApplied, rf.lastIncludedIndex)
 
 	rf.persist(args.Data)
+
+	// 快照数据已同步落盘
+	if rf.lastIncludedIndex > rf.persistedIndex {
+		rf.persistedIndex = rf.lastIncludedIndex
+	}
+	rf.commitCond.Signal()
 
 	// 保存 snapshot 数据
 	snapshotData := args.Data
@@ -1390,12 +1446,11 @@ func (rf *Raft) sendHeartbeats() {
 			// fmt.Printf("[log]:later AppendEntries %d peer, matchIndex[%d] = %d, nextIndex[%d] = %d\n", server, server, rf.matchIndex[server], server, rf.nextIndex[server])
 
 			// 推进 commitIndex
+			// 安全红线：Leader 只有在条目已本地持久化时才将自己计入多数派。
+			// 若未持久化，则需要额外一个 Follower 的 ACK 才能提交。
 			for N := rf.getLastLogIndex(); N > rf.CommitIndex && N >= 1; N-- {
 
 				// 只提交当前任期的日志
-				// if rf.log[N].Term != rf.CurrentTerm {
-				// 	continue
-				// }
 				if N == rf.lastIncludedIndex {
 					continue
 				}
@@ -1403,7 +1458,11 @@ func (rf *Raft) sendHeartbeats() {
 					continue
 				}
 
-				count := 1 // leader自己
+				count := 0
+				// Leader 只有在条目已落盘时才将自己计入多数派
+				if N <= rf.persistedIndex {
+					count = 1
+				}
 
 				for i := range rf.peers {
 					if i != rf.me && rf.matchIndex[i] >= N {
@@ -1413,7 +1472,7 @@ func (rf *Raft) sendHeartbeats() {
 
 				if count > len(rf.peers)/2 {
 					rf.CommitIndex = N
-					// fmt.Printf("count > len(rf.peers)/2, rf.CommitIndex = N = %d", N);
+					rf.commitCond.Signal()
 					break
 				}
 			}
@@ -1523,14 +1582,14 @@ func (rf *Raft) startElection() {
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
-		// 检查是否需要发起领导者选举。
+		// 检查是否需要发起领导者选举（只读，使用 RLock）。
 		needStart := false
-		rf.mu.Lock()
+		rf.mu.RLock()
 		if rf.state != Leader && time.Since(rf.lastHeard) > rf.electionTimeout {
 			// 超时未收到心跳，发起选举
 			needStart = true
 		}
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		if needStart {
 			rf.startElection()
 		}
@@ -1547,8 +1606,9 @@ func (rf *Raft) applier() {
 
 		rf.mu.Lock()
 
-		// 只应用已提交且未被应用的日志
-		for rf.LastApplied < rf.CommitIndex {
+		// 安全红线：LastApplied 不能超过 CommitIndex 也不能超过 persistedIndex。
+		// 这确保只有已提交且已持久化的条目才会被应用到状态机。
+		for rf.LastApplied < rf.CommitIndex && rf.LastApplied < rf.persistedIndex {
 			rf.LastApplied++
 			index := rf.LastApplied
 
@@ -1574,13 +1634,17 @@ func (rf *Raft) applier() {
 			})
 		}
 
+		// 没有可应用的条目时，通过条件变量休眠（替代 busy-loop）
+		if len(msgs) == 0 && !rf.killed() {
+			rf.commitCond.Wait()
+		}
+
 		rf.mu.Unlock()
 
 		// 释放锁后批量发送
 		for _, msg := range msgs {
 			rf.applyCh <- msg
 		}
-
 	}
 }
 
@@ -1600,6 +1664,9 @@ func Make(peers []string, me int,
 	rf.me = me
 	rf.electionTimeout = time.Duration(300+rand.Intn(200)) * time.Millisecond
 	rf.lastHeard = time.Now()
+
+	// commitCond 必须在 mu 分配后立即初始化（依赖 &rf.mu）
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	rf.setStateLocked(Follower)
 	rf.VotedFor = -1
@@ -1624,6 +1691,11 @@ func Make(peers []string, me int,
 	rf.readHardState(persister.ReadHardState())
 	rf.CommitIndex = rf.lastIncludedIndex
 	rf.LastApplied = rf.lastIncludedIndex
+
+	// 启动时所有恢复的日志条目均来自磁盘，persistedIndex 覆盖全部已恢复日志。
+	// rf.log[0] 为 dummy 条目（位于 lastIncludedIndex），
+	// 因此实际持久化的最高逻辑索引 = lastIncludedIndex + len(rf.log) - 1。
+	rf.persistedIndex = rf.lastIncludedIndex + len(rf.log) - 1
 
 	// 快照由 InstallSnapshot 和 applier 自动处理
 

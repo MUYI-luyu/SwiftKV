@@ -3,10 +3,15 @@ package sharding
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
+
+	"github.com/cespare/xxhash/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // MigrationPlanItem 描述单个 key 的迁移计划。
@@ -312,4 +317,220 @@ func (m *Migrator) ExecutePlan(ctx context.Context, plan []MigrationPlanItem, de
 		return stats, fmt.Errorf("migration finished with %d failures", stats.Failed)
 	}
 	return stats, nil
+}
+
+// connectToShardService 建立到指定 group 中第一个可达 replica 的 ShardService 连接。
+func connectToShardService(ctx context.Context, router *ShardRouter, gid int) (pb.ShardServiceClient, *grpc.ClientConn, error) {
+	addrs := router.groupReplicaAddrs(gid)
+	if len(addrs) == 0 {
+		return nil, nil, fmt.Errorf("group %d has no replicas", gid)
+	}
+	for _, addr := range addrs {
+		conn, err := grpc.DialContext(ctx, addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		if err != nil {
+			continue
+		}
+		return pb.NewShardServiceClient(conn), conn, nil
+	}
+	return nil, nil, fmt.Errorf("no reachable replica for group %d", gid)
+}
+
+// shardKey 计算 key 所属的 shard ID。
+func shardKey(key string, numShards int) int {
+	return int(xxhash.Sum64String(key) % uint64(numShards))
+}
+
+// groupReplicaAddrs 获取 group 的可用 replica 地址。
+func (r *ShardRouter) groupReplicaAddrs(gid int) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.groupsByID[gid]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), g.Replicas...)
+}
+
+// MigrateShardOnline 在线迁移一个 shard，迁移期间不停止写入（6 阶段）。
+//
+// 流程：
+//   Phase 1: target ← IMPORTING
+//   Phase 2: source ← MIGRATING(target)    ← 双写开始
+//   Phase 3: 批量同步存量数据
+//   Phase 4: target ← OWNED                ← 双写结束
+//   Phase 5: source ← ABSENT
+//   Phase 6: 清理源数据
+func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGID, targetGID int, prefix string) error {
+	if m == nil || m.source == nil || m.target == nil {
+		return fmt.Errorf("migrator is nil")
+	}
+
+	// 连接到源 group 和目标 group 的 server（用于调用 SetShardState）
+	srcCtx, srcCancel := context.WithTimeout(ctx, 5*time.Second)
+	src, srcConn, err := connectToShardService(srcCtx, m.source, sourceGID)
+	srcCancel()
+	if err != nil {
+		return fmt.Errorf("connect to source group %d: %w", sourceGID, err)
+	}
+	defer srcConn.Close()
+
+	tgtCtx, tgtCancel := context.WithTimeout(ctx, 5*time.Second)
+	tgt, tgtConn, err := connectToShardService(tgtCtx, m.target, targetGID)
+	tgtCancel()
+	if err != nil {
+		return fmt.Errorf("connect to target group %d: %w", targetGID, err)
+	}
+	defer tgtConn.Close()
+
+	baseEpoch := m.source.TopologyEpoch()
+	nextEpoch := baseEpoch + 1
+
+	// Phase 1: Target ← IMPORTING（准备接收）
+	log.Printf("[migrate] Phase 1: shard=%d target=%d ← IMPORTING", shardID, targetGID)
+	if _, err := tgt.SetShardState(ctx, &pb.SetShardStateRequest{
+		ShardId: int32(shardID), State: pb.ShardState_IMPORTING,
+		TargetGroup: int32(sourceGID), TopologyEpoch: nextEpoch,
+	}); err != nil {
+		return fmt.Errorf("phase 1 target.IMPORTING failed: %w", err)
+	}
+	nextEpoch++
+
+	// Phase 2: Source ← MIGRATING(target)（双写开始）
+	log.Printf("[migrate] Phase 2: shard=%d source=%d ← MIGRATING → target=%d", shardID, sourceGID, targetGID)
+	// 获取 target group 的 replica 地址列表供双写转发使用
+	targetReplicas := m.target.groupReplicaAddrs(targetGID)
+	if _, err := src.SetShardState(ctx, &pb.SetShardStateRequest{
+		ShardId: int32(shardID), State: pb.ShardState_MIGRATING,
+		TargetGroup: int32(targetGID), TopologyEpoch: nextEpoch,
+	}); err != nil {
+		// 回滚 Phase 1
+		tgt.SetShardState(ctx, &pb.SetShardStateRequest{
+			ShardId: int32(shardID), State: pb.ShardState_OWNED, TopologyEpoch: nextEpoch + 1,
+		})
+		return fmt.Errorf("phase 2 source.MIGRATING failed: %w", err)
+	}
+	_ = targetReplicas // replicas are already configured on the source server
+	nextEpoch++
+
+	// Phase 3: 批量同步存量数据
+	log.Printf("[migrate] Phase 3: shard=%d bulk copy data", shardID)
+	if err := m.bulkCopyShard(ctx, shardID, sourceGID, targetGID, prefix); err != nil {
+		return fmt.Errorf("phase 3 bulk copy failed: %w", err)
+	}
+
+	// Phase 4: Target ← OWNED（双写结束，target 成为正式 owner）
+	log.Printf("[migrate] Phase 4: shard=%d target=%d ← OWNED", shardID, targetGID)
+	if _, err := tgt.SetShardState(ctx, &pb.SetShardStateRequest{
+		ShardId: int32(shardID), State: pb.ShardState_OWNED, TopologyEpoch: nextEpoch,
+	}); err != nil {
+		return fmt.Errorf("phase 4 target.OWNED failed: %w", err)
+	}
+	nextEpoch++
+
+	// Phase 5: Source ← ABSENT（停止服务该 shard）
+	log.Printf("[migrate] Phase 5: shard=%d source=%d ← ABSENT", shardID, sourceGID)
+	if _, err := src.SetShardState(ctx, &pb.SetShardStateRequest{
+		ShardId: int32(shardID), State: pb.ShardState_ABSENT, TopologyEpoch: nextEpoch,
+	}); err != nil {
+		return fmt.Errorf("phase 5 source.ABSENT failed: %w", err)
+	}
+	nextEpoch++
+
+	// Phase 6: 清理源数据
+	log.Printf("[migrate] Phase 6: shard=%d clean source=%d data", shardID, sourceGID)
+	if err := m.cleanShardData(ctx, shardID, sourceGID, prefix); err != nil {
+		log.Printf("[migrate] Phase 6 warning: clean source data failed: %v (data will be orphaned)", err)
+	}
+
+	log.Printf("[migrate] shard=%d migration complete: %d → %d", shardID, sourceGID, targetGID)
+	return nil
+}
+
+// bulkCopyShard 从源 group 扫描属于指定 shard 的 key，批量写入目标 group。
+func (m *Migrator) bulkCopyShard(ctx context.Context, shardID, sourceGID, targetGID int, prefix string) error {
+	const batchSize = 50
+	var cursor string
+	totalCopied := 0
+	numShards := m.source.TopologyNumShards()
+
+	for {
+		items, err := m.source.ScanGroup(ctx, sourceGID, prefix+cursor, int32(batchSize))
+		if err != nil {
+			return fmt.Errorf("scan source failed: %w", err)
+		}
+		if len(items) == 0 {
+			break
+		}
+
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			// 只迁移属于目标 shard 的 key
+			if shardKey(item.GetKey(), numShards) != shardID {
+				continue
+			}
+			if _, err := m.target.PutToGroup(ctx, targetGID, item.GetKey(), item.GetValue(), item.GetVersion()); err != nil {
+				return fmt.Errorf("put to target failed key=%s: %w", item.GetKey(), err)
+			}
+			totalCopied++
+		}
+
+		// 使用最后一个 key 作为游标继续扫描
+		lastKey := items[len(items)-1].GetKey()
+		if lastKey <= cursor {
+			break
+		}
+		cursor = lastKey
+	}
+	log.Printf("[migrate] bulk copied %d keys for shard %d", totalCopied, shardID)
+	return nil
+}
+
+// cleanShardData 清理源 group 中属于指定 shard 的数据。
+func (m *Migrator) cleanShardData(ctx context.Context, shardID, sourceGID int, prefix string) error {
+	const batchSize = 100
+	totalDeleted := 0
+	numShards := m.source.TopologyNumShards()
+
+	for {
+		items, err := m.source.ScanGroup(ctx, sourceGID, prefix, int32(batchSize))
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			break
+		}
+
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			if shardKey(item.GetKey(), numShards) != shardID {
+				continue
+			}
+			if _, err := m.source.DeleteFromGroup(ctx, sourceGID, item.GetKey()); err != nil {
+				log.Printf("[migrate] clean: delete %s failed: %v", item.GetKey(), err)
+				continue
+			}
+			totalDeleted++
+		}
+		// 防止无限循环：如果所有返回的 key 都不属于目标 shard
+		if len(items) < batchSize {
+			break
+		}
+	}
+	log.Printf("[migrate] cleaned %d keys from source group %d", totalDeleted, sourceGID)
+	return nil
+}
+
+// TopologyNumShards 返回 router 中 topology 的 shard 总数。
+func (r *ShardRouter) TopologyNumShards() int {
+	if r.topology == nil {
+		return 1024
+	}
+	return r.topology.NumShards()
 }

@@ -14,7 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"kvraft/pkg/rsm"
+	"kvraft/pkg/kv"
+	"kvraft/pkg/persister"
 )
 
 func getenvInt(name string, def int) int {
@@ -48,7 +49,7 @@ func runtimeDataRoot() string {
 	return "data"
 }
 
-func startHTTP(addr string, kv *rsm.KVServer) *http.Server {
+func startHTTP(addr string, kv *kv.KVServer) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		if kv.IsAlive() {
@@ -76,7 +77,7 @@ func startHTTP(addr string, kv *rsm.KVServer) *http.Server {
 	return srv
 }
 
-func startMetricsHTTP(addr string, kv *rsm.KVServer) *http.Server {
+func startMetricsHTTP(addr string, kv *kv.KVServer) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		stats := kv.StatsSnapshot()
@@ -126,6 +127,7 @@ func startPprofHTTP(addr string) *http.Server {
 
 func main() {
 	nodeID := getenvInt("NODE_ID", 0)
+	groupID := getenvInt("GROUP_ID", 1)
 	peers := strings.TrimSpace(os.Getenv("RAFT_PEERS"))
 	if peers == "" {
 		log.Fatal("RAFT_PEERS is required, e.g. kvraft-node-0:50000,kvraft-node-1:50001,kvraft-node-2:50002")
@@ -145,17 +147,18 @@ func main() {
 	maxRaftState := getenvInt("MAX_RAFT_STATE", 1048576)
 
 	dataDir := filepath.Join(runtimeDataRoot(), fmt.Sprintf("node-%d", nodeID))
-	persister, err := rsm.NewFilePersister(dataDir)
+	fp, err := persister.NewFilePersister(dataDir)
 	if err != nil {
 		log.Fatalf("create persister failed: %v", err)
 	}
-	defer persister.Close()
+	defer fp.Close()
 
-	kv := rsm.StartKVServer(servers, 1, nodeID, persister, maxRaftState, rpcAddr)
+	kvServer := kv.StartKVServer(servers, groupID, nodeID, fp, maxRaftState, rpcAddr)
+	log.Printf("kvraft node started: node_id=%d group_id=%d rpc=%s rest=%s metrics=%s pprof=%s", nodeID, groupID, rpcAddr, httpAddr, metricsAddr, pprofAddr)
 	log.Printf("kvraft node started: node_id=%d rpc=%s rest=%s metrics=%s pprof=%s", nodeID, rpcAddr, httpAddr, metricsAddr, pprofAddr)
 
-	httpSrv := startHTTP(httpAddr, kv)
-	metricsSrv := startMetricsHTTP(metricsAddr, kv)
+	httpSrv := startHTTP(httpAddr, kvServer)
+	metricsSrv := startMetricsHTTP(metricsAddr, kvServer)
 	var pprofSrv *http.Server
 	if pprofAddr != "" {
 		pprofSrv = startPprofHTTP(pprofAddr)
@@ -181,5 +184,5 @@ func main() {
 		_ = pprofSrv.Shutdown(ctx)
 		cancel()
 	}
-	kv.Kill()
+	kvServer.Kill()
 }

@@ -9,6 +9,9 @@ type Node interface {
 	// GetState 返回本节点当前的任期号及是否为 leader。
 	GetState() (int, bool)
 
+	// GetLastApplied 返回已应用到状态机的最高日志索引。
+	GetLastApplied() int
+
 	// Snapshot 触发快照功能。
 	Snapshot(index int, snapshot []byte)
 

@@ -249,6 +249,34 @@ start_cluster() {
   fi
 }
 
+# 检测：请求的 groups/replicas 与运行中集群是否匹配
+# runtime.env 由 run_cluster.sh 写入，包含上次启动的集群参数
+if [[ "${RESTART_CLUSTER}" != "true" ]]; then
+  R_RUN_GROUPS="$(runtime_value GROUPS)"
+  R_RUN_REPLICAS="$(runtime_value REPLICAS)"
+  R_RUN_ARCH="$(runtime_value ARCH)"
+
+  if [[ "${ARCH}" == "group-ring" ]]; then
+    if [[ -n "${R_RUN_GROUPS}" && "${R_RUN_GROUPS}" != "${SHARD_GROUPS}" ]]; then
+      echo "检测到 groups 配置变化: 运行中=${R_RUN_GROUPS}, 请求=${SHARD_GROUPS}，自动重启集群"
+      RESTART_CLUSTER=true
+    elif [[ -n "${R_RUN_REPLICAS}" && "${R_RUN_REPLICAS}" != "${REPLICAS}" ]]; then
+      echo "检测到 replicas 配置变化: 运行中=${R_RUN_REPLICAS}, 请求=${REPLICAS}，自动重启集群"
+      RESTART_CLUSTER=true
+    elif [[ -n "${R_RUN_ARCH}" && "${R_RUN_ARCH}" != "${ARCH}" ]]; then
+      echo "检测到 arch 配置变化: 运行中=${R_RUN_ARCH}, 请求=${ARCH}，自动重启集群"
+      RESTART_CLUSTER=true
+    fi
+  else
+    # node-ring 模式：servers 变化也需要重启
+    R_RUN_SERVERS="$(runtime_value TOTAL_NODES)"
+    if [[ -n "${R_RUN_SERVERS}" && "${R_RUN_SERVERS}" != "${SERVERS}" ]]; then
+      echo "检测到 servers 配置变化: 运行中=${R_RUN_SERVERS}, 请求=${SERVERS}，自动重启集群"
+      RESTART_CLUSTER=true
+    fi
+  fi
+fi
+
 if [[ "${RESTART_CLUSTER}" == "true" ]]; then
   ./scripts/stop_cluster.sh >/dev/null 2>&1 || true
   start_cluster

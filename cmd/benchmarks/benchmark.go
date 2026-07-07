@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"kvraft/pkg/kv"
+	"kvraft/pkg/persister"
 	"kvraft/pkg/raft"
-	"kvraft/pkg/rsm"
 	"kvraft/pkg/sharding"
 )
 
@@ -87,6 +87,7 @@ func loadShardingConfig(path string) (*sharding.ShardingConfig, error) {
 	}
 	type cfgJSON struct {
 		Groups            []groupJSON `json:"groups"`
+		NumShards         int         `json:"num_shards"`
 		VirtualNodeCount  int         `json:"virtual_node_count"`
 		ConnectTimeoutMS  int         `json:"connect_timeout_ms"`
 		RequestTimeoutMS  int         `json:"request_timeout_ms"`
@@ -114,6 +115,7 @@ func loadShardingConfig(path string) (*sharding.ShardingConfig, error) {
 
 	cfg := &sharding.ShardingConfig{
 		Groups:            groups,
+		NumShards:         parsed.NumShards,
 		VirtualNodeCount:  parsed.VirtualNodeCount,
 		PreferredReplicas: parsed.PreferredReplicas,
 		ConnectTimeout:    time.Duration(parsed.ConnectTimeoutMS) * time.Millisecond,
@@ -122,12 +124,12 @@ func loadShardingConfig(path string) (*sharding.ShardingConfig, error) {
 	return cfg, nil
 }
 
-func makeBenchmarkClerk(servers []string, shardedMode bool, shardingCfg *sharding.ShardingConfig) (*rsm.Clerk, error) {
+func makeBenchmarkClerk(servers []string, shardedMode bool, shardingCfg *sharding.ShardingConfig) (*kv.Clerk, error) {
 	if !shardedMode {
-		return rsm.MakeClerk(servers), nil
+		return kv.MakeClerk(servers), nil
 	}
 	if shardingCfg != nil {
-		return rsm.MakeShardedClerk(*shardingCfg)
+		return kv.MakeShardedClerk(*shardingCfg)
 	}
 
 	replicas := make([]string, 0, len(servers))
@@ -146,7 +148,7 @@ func makeBenchmarkClerk(servers []string, shardedMode bool, shardingCfg *shardin
 		RequestTimeout:    1200 * time.Millisecond,
 	}
 
-	return rsm.MakeShardedClerk(cfg)
+	return kv.MakeShardedClerk(cfg)
 }
 
 // RunRealBenchmark 启动一个实际的 KVraft 集群进行压测
@@ -194,7 +196,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	}
 
 	manageCluster := len(cfg.ServerAddrs) == 0
-	kvServers := make([]*rsm.KVServer, cfg.Servers)
+	kvServers := make([]*kv.KVServer, cfg.Servers)
 	var shardingCfg *sharding.ShardingConfig
 	if cfg.Sharded && strings.TrimSpace(cfg.ShardingConfig) != "" {
 		loadedCfg, err := loadShardingConfig(strings.TrimSpace(cfg.ShardingConfig))
@@ -212,12 +214,12 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		persisters := make([]raft.Persister, cfg.Servers)
 
 		for i := 0; i < cfg.Servers; i++ {
-			p, err := rsm.NewFilePersister(benchmarkDataDir(servers[i]))
+			p, err := persister.NewFilePersister(benchmarkDataDir(servers[i]))
 			if err != nil {
 				return BenchmarkResult{}, fmt.Errorf("create persister for server %d: %w", i, err)
 			}
 			persisters[i] = p
-			kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], cfg.MaxRaftState, servers[i])
+			kvServers[i] = kv.StartKVServer(servers, 1, i, persisters[i], cfg.MaxRaftState, servers[i])
 		}
 		fmt.Printf(" OK (%d 个节点)\n", cfg.Servers)
 	} else {
@@ -342,7 +344,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	var totalLatency time.Duration
 	var latencySamples int64
 	latencyValues := make([]int64, 0, cfg.Clients*cfg.Requests)
-	workerClerks := make([]*rsm.Clerk, cfg.Clients)
+	workerClerks := make([]*kv.Clerk, cfg.Clients)
 	for i := 0; i < cfg.Clients; i++ {
 		c, err := makeBenchmarkClerk(servers, cfg.Sharded, shardingCfg)
 		if err != nil {

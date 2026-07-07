@@ -1,4 +1,4 @@
-package rsm
+package kv
 
 import (
 	"context"
@@ -11,17 +11,34 @@ import (
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
-	"kvraft/pkg/kv"
 	"kvraft/pkg/watch"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 )
 
-// grpcKVService 将现有 KVServer 能力暴露为 gRPC 接口。
+// grpcKVService 将现有 KVServer 能力暴露为 gRPC 接口，
+// 同时实现 ShardServiceServer 以支持分片迁移管理。
 type grpcKVService struct {
 	pb.UnimplementedKVServiceServer
+	pb.UnimplementedShardServiceServer
 	kv *KVServer
+}
+
+// SetShardState 实现 ShardServiceServer。由迁移协调器调用来修改 shard 状态。
+func (s *grpcKVService) SetShardState(ctx context.Context, req *pb.SetShardStateRequest) (*pb.SetShardStateResponse, error) {
+	err := s.kv.SetShardState(int(req.GetShardId()), req.GetState(), int(req.GetTargetGroup()), req.GetTopologyEpoch(), nil)
+	if err != nil {
+		return &pb.SetShardStateResponse{Error: err.Error()}, nil
+	}
+	return &pb.SetShardStateResponse{}, nil
+}
+
+// GetShardStates 实现 ShardServiceServer。
+func (s *grpcKVService) GetShardStates(ctx context.Context, req *pb.GetShardStatesRequest) (*pb.GetShardStatesResponse, error) {
+	entries, epoch := s.kv.GetShardStates()
+	return &pb.GetShardStatesResponse{States: entries, TopologyEpoch: epoch}, nil
 }
 
 // 根据已有的 Raft RPC 地址，自动生成一个用于 gRPC 服务的监听地址
@@ -40,25 +57,24 @@ func grpcAddrFromRPC(addr string) string {
 	return net.JoinHostPort(host, strconv.Itoa(p+1000))
 }
 
-func errReply(e kv.Err) string {
+func errReply(e Err) string {
 	return string(e)
 }
 
 func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	if s.kv.killed() {
 		s.kv.stats.RecordFailure()
-		return &pb.GetResponse{Error: errReply(kv.ErrWrongLeader)}, nil
+		return &pb.GetResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
-	err, ret, leaseHit := s.kv.rsm.SubmitLeaseReadWithMode(&kv.GetArgs{Key: req.GetKey()})
-	if err != kv.OK {
+	err, ret, leaseHit := s.kv.rsm.SubmitLeaseReadWithMode(&GetArgs{Key: req.GetKey()})
+	if err != OK {
 		s.kv.stats.RecordFailure()
 		s.kv.stats.RecordLeaseFallback()
 		return &pb.GetResponse{Error: errReply(err)}, nil
 	}
 
-	// 判断 ret 是否为预期的 GetReply 类型
-	reply, ok := ret.(kv.GetReply)
+	reply, ok := ret.(GetReply)
 	if !ok {
 		s.kv.stats.RecordFailure()
 		return &pb.GetResponse{Error: "ErrInternal"}, nil
@@ -83,16 +99,16 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 
 func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	if s.kv.killed() {
-		return &pb.PutResponse{Error: errReply(kv.ErrWrongLeader)}, nil
+		return &pb.PutResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
-	args := &kv.PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: kv.Tversion(req.GetVersion()), TTL: req.GetTtlSeconds()}
+	args := &PutArgs{Key: req.GetKey(), Value: req.GetValue(), Version: Tversion(req.GetVersion()), TTL: req.GetTtlSeconds()}
 	err, ret := s.kv.rsm.Submit(args)
-	if err != kv.OK {
+	if err != OK {
 		return &pb.PutResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kv.PutReply)
+	reply, ok := ret.(PutReply)
 	if !ok {
 		return &pb.PutResponse{Error: "ErrInternal"}, nil
 	}
@@ -102,15 +118,15 @@ func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRes
 
 func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	if s.kv.killed() {
-		return &pb.DeleteResponse{Error: errReply(kv.ErrWrongLeader)}, nil
+		return &pb.DeleteResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.Submit(&kv.DeleteArgs{Key: req.GetKey()})
-	if err != kv.OK {
+	err, ret := s.kv.rsm.Submit(&DeleteArgs{Key: req.GetKey()})
+	if err != OK {
 		return &pb.DeleteResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kv.DeleteReply)
+	reply, ok := ret.(DeleteReply)
 	if !ok {
 		return &pb.DeleteResponse{Error: "ErrInternal"}, nil
 	}
@@ -120,15 +136,15 @@ func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.
 
 func (s *grpcKVService) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
 	if s.kv.killed() {
-		return &pb.ScanResponse{Error: errReply(kv.ErrWrongLeader)}, nil
+		return &pb.ScanResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
-	err, ret := s.kv.rsm.Submit(&kv.ScanArgs{Prefix: req.GetPrefix(), Limit: req.GetLimit()})
-	if err != kv.OK {
+	err, ret := s.kv.rsm.Submit(&ScanArgs{Prefix: req.GetPrefix(), Limit: req.GetLimit()})
+	if err != OK {
 		return &pb.ScanResponse{Error: errReply(err)}, nil
 	}
 
-	reply, ok := ret.(kv.ScanReply)
+	reply, ok := ret.(ScanReply)
 	if !ok {
 		return &pb.ScanResponse{Error: "ErrInternal"}, nil
 	}
@@ -171,7 +187,6 @@ func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, p
 
 		switch t := req.GetRequestType().(type) {
 		case *pb.WatchRequest_Create:
-			// 同一流内重复 Create 时，先清理旧订阅，确保仅保留当前订阅。
 			stopCurrent()
 
 			w, subErr := watchMgr.Subscribe(t.Create.GetKey(), t.Create.GetPrefix())
@@ -225,22 +240,37 @@ func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, p
 }
 
 func (s *grpcKVService) GetClusterStatus(ctx context.Context, req *pb.ClusterStatusRequest) (*pb.ClusterStatusResponse, error) {
-	term, isLeader := s.kv.rsm.Raft().GetState()
+	term, isLeader := s.kv.rsm.GetState()
+	lastApplied := s.kv.rsm.GetLastApplied()
 	node := &pb.NodeStatus{Id: int32(s.kv.me), Address: grpcAddrFromRPC(s.kv.address), IsLeader: isLeader, IsAlive: !s.kv.killed()}
 	return &pb.ClusterStatusResponse{
-		LeaderId:    fmt.Sprintf("node-%d", s.kv.me),
-		Nodes:       []*pb.NodeStatus{node},
-		CurrentTerm: int64(term),
-		LastApplied: 0,
+		LeaderId:      fmt.Sprintf("node-%d", s.kv.me),
+		Nodes:         []*pb.NodeStatus{node},
+		CurrentTerm:   int64(term),
+		LastApplied:   int64(lastApplied),
+		GroupId:       int32(s.kv.groupID),
+		TopologyEpoch: 0, // 服务端暂无 topology 对象，单 group 场景下 epoch 恒为 1
 	}, nil
 }
 
-func startGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) {
+func StartGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) {
 	grpcAddr := grpcAddrFromRPC(rpcAddr)
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		log.Fatalf("start grpc listener %s failed: %v", grpcAddr, err)
 	}
+
+	// Unary interceptor: 每个响应 header 注入 group ID 和拓扑版本号
+	topoInterceptor := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		resp, err := handler(ctx, req)
+		// 通过 trailer 返回拓扑元数据（不影响业务响应体）
+		_ = grpc.SetHeader(ctx, metadata.Pairs(
+			"x-group-id", strconv.Itoa(kv.groupID),
+			"x-topology-epoch", strconv.FormatInt(kv.TopologyEpoch(), 10),
+		))
+		return resp, err
+	}
+
 	gs := grpc.NewServer(
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             10 * time.Second,
@@ -250,15 +280,20 @@ func startGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) 
 			Time:    2 * time.Minute,
 			Timeout: 20 * time.Second,
 		}),
+		grpc.UnaryInterceptor(topoInterceptor),
 	)
-	pb.RegisterKVServiceServer(gs, &grpcKVService{kv: kv})
+
+	svc := &grpcKVService{kv: kv}
+	pb.RegisterKVServiceServer(gs, svc)
+	pb.RegisterShardServiceServer(gs, svc)
 	go func() {
 		if serveErr := gs.Serve(lis); serveErr != nil {
 			log.Printf("grpc serve stopped on %s: %v", grpcAddr, serveErr)
 		}
 	}()
 
-	// 避免服务刚启动时客户端短暂拨号失败。
 	time.Sleep(20 * time.Millisecond)
+	kv.grpcSrv = gs
+	kv.grpcLn = lis
 	return gs, lis
 }

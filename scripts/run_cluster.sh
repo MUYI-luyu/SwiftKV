@@ -236,8 +236,9 @@ else
             log_file="${LOG_DIR}/group-${g}-node-${r}.log"
             pid_file="${PID_DIR}/group-${g}-node-${r}.pid"
 
-            echo "启动 group ${g} node ${r} (rpc=${rpc_port}, grpc=${grpc_port}, rest=${rest_port}, metrics=${metrics_port})"
+            echo "启动 group ${g} (gid=$((g+1))) node ${r} (rpc=${rpc_port}, grpc=${grpc_port}, rest=${rest_port}, metrics=${metrics_port})"
             NODE_ID="${r}" \
+            GROUP_ID="$((g+1))" \
             RAFT_PEERS="${peers}" \
             REST_LISTEN="127.0.0.1:${rest_port}" \
             METRICS_LISTEN="127.0.0.1:${metrics_port}" \

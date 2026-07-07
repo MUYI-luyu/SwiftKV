@@ -3,6 +3,11 @@
 // 以及错误码和版本号类型。
 package kv
 
+import (
+	"kvraft/pkg/raft"
+	"kvraft/pkg/watch"
+)
+
 // Tversion 表示一个键的版本号。
 type Tversion int
 
@@ -15,6 +20,7 @@ const (
 	ErrWrongLeader Err = "ErrWrongLeader"
 	ErrVersion     Err = "ErrVersion"
 	ErrMaybe       Err = "ErrMaybe"
+	ErrWrongGroup  Err = "ErrWrongGroup"  // shard 不属于本 group
 )
 
 // GetArgs 是 Get 操作的参数。
@@ -86,4 +92,37 @@ type ExpireReply struct {
 	ExpiredKeys      []string
 	ExpiredOldValues map[string]string
 	Err              Err
+}
+
+// OpCompleteListener 操作完成监听器接口
+// 用于在 Raft 日志提交后回调，例如触发 Watch 事件
+type OpCompleteListener interface {
+	// OnOpComplete 在操作被 Raft 提交和应用后调用
+	// req: 原始请求
+	// result: 操作结果
+	// index: Raft 日志索引
+	OnOpComplete(req any, result any, index int64)
+}
+
+// ApplyLoopPerfStats 记录 applyLoop 的性能统计
+type ApplyLoopPerfStats struct {
+	BlockedNanos    int64
+	ProcessNanos    int64
+	IterationCount  int64
+	BlockedAvgNanos float64
+	ProcessAvgNanos float64
+}
+
+// RSMInterface 是复制状态机（RSM）的核心接口，供 KVServer 和 gRPC 层调用。
+type RSMInterface interface {
+	Submit(req any) (Err, any)
+	SubmitLeaseReadWithMode(req any) (Err, any, bool)
+	GetWatchManager() *watch.Manager
+	RegisterOpCompleteListener(listener OpCompleteListener)
+	GetState() (int, bool)
+	GetLastApplied() int
+	IsLeaderWithLease() bool
+	Close()
+	ApplyLoopPerfStatsSnapshot() ApplyLoopPerfStats
+	RaftPerfStatsSnapshot() raft.RaftPerfStats
 }

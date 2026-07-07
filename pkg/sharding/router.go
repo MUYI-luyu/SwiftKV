@@ -26,17 +26,19 @@ type RaftGroupConfig struct {
 // ShardingConfig 描述路由层配置。
 type ShardingConfig struct {
 	Groups            []RaftGroupConfig
-	VirtualNodeCount  int
+	NumShards         int // shard 总数，<=0 时默认 1024
+	VirtualNodeCount  int // Deprecated: 已替换为 NumShards，保留以兼容旧配置
 	PreferredReplicas int
 	ConnectTimeout    time.Duration
 	RequestTimeout    time.Duration
 }
 
-// ShardRouter 基于一致性哈希将请求路由到对应分组。
+// ShardRouter 基于 ShardTopology 将请求路由到对应分组。
+// key → shard → group → replica（含 leader 缓存和自动故障切换）。
 type ShardRouter struct {
 	mu                   sync.RWMutex
 	config               ShardingConfig
-	hashRing             *ConsistentHash
+	topology             *ShardTopology
 	groupClients         map[int]map[string]pb.KVServiceClient
 	groupConns           map[int]map[string]*grpc.ClientConn
 	groupsByID           map[int]RaftGroupConfig
@@ -75,16 +77,16 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 
 	r := &ShardRouter{
 		config:               cfg,
-		hashRing:             NewConsistentHash(cfg.VirtualNodeCount),
-		groupConns:           make(map[int]map[string]*grpc.ClientConn),      // 物理连接池
-		groupClients:         make(map[int]map[string]pb.KVServiceClient),    // 业务逻辑接口池
-		groupsByID:           make(map[int]RaftGroupConfig, len(cfg.Groups)), // 配置查找表
-		leaderCache:          make(map[int]string),                           // leader状态缓存表
+		groupConns:           make(map[int]map[string]*grpc.ClientConn),
+		groupClients:         make(map[int]map[string]pb.KVServiceClient),
+		groupsByID:           make(map[int]RaftGroupConfig, len(cfg.Groups)),
+		leaderCache:          make(map[int]string),
 		leaderCacheUpdatedAt: make(map[int]time.Time, len(cfg.Groups)),
 		leaderCacheTTL:       defaultLeaderCacheTTL,
 	}
 
-	// 构建分片映射
+	// 构建分片拓扑
+	topoGroups := make(map[int][]string, len(cfg.Groups))
 	for _, g := range cfg.Groups {
 		if g.GroupID <= 0 {
 			return nil, fmt.Errorf("invalid group id %d", g.GroupID)
@@ -96,8 +98,9 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 			return nil, fmt.Errorf("duplicate group id %d", g.GroupID)
 		}
 		r.groupsByID[g.GroupID] = g
-		r.hashRing.AddNode(fmt.Sprintf("group-%d", g.GroupID))
+		topoGroups[g.GroupID] = g.Replicas
 	}
+	r.topology = NewShardTopology(cfg.NumShards, topoGroups)
 
 	// 连接初始化
 	if err := r.initConnections(); err != nil {
@@ -145,18 +148,28 @@ func (r *ShardRouter) initConnections() error {
 }
 
 // Resolve 返回 key 对应的分组 ID。
+// 使用 ShardTopology 的 shard 抽象：key → shard → group，O(1)。
 func (r *ShardRouter) Resolve(key string) int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	node := r.hashRing.GetNode(key)
-	if node == "" {
+	if r.topology == nil {
 		return -1
 	}
+	return r.topology.Resolve(key)
+}
 
-	var gid int
-	_, _ = fmt.Sscanf(node, "group-%d", &gid)
-	return gid
+// ResolveWithEpoch 返回 group ID 和当前拓扑版本号。
+func (r *ShardRouter) ResolveWithEpoch(key string) (int, int64) {
+	if r.topology == nil {
+		return -1, 0
+	}
+	return r.topology.ResolveWithEpoch(key)
+}
+
+// TopologyEpoch 返回当前拓扑版本号。
+func (r *ShardRouter) TopologyEpoch() int64 {
+	if r.topology == nil {
+		return 0
+	}
+	return r.topology.GetEpoch()
 }
 
 // 返回 key 对应的分组 ID。
@@ -500,13 +513,38 @@ func (r *ShardRouter) ScanRoute(ctx context.Context, prefix string, limit int32)
 		return r.ScanGroup(ctx, gids[0], prefix, limit)
 	}
 
+	// 多 group 并行扫描：每个 group 最多取 limit 条。
+	// 全局 top-K 必然落在各 group 的 top-K 之中（最多 limit×numGroups 条），
+	// 内存 O(limit×numGroups) 替代原来的 O(全量数据)。
+	perGroupLimit := limit
+	if perGroupLimit <= 0 {
+		perGroupLimit = 0 // 无限制时仍需全量
+	}
+
+	type scanResult struct {
+		items []*pb.KeyValue
+		err   error
+	}
+	results := make([]scanResult, len(gids))
+	var wg sync.WaitGroup
+
+	for i, gid := range gids {
+		wg.Add(1)
+		go func(idx int, groupID int) {
+			defer wg.Done()
+			items, scanErr := r.ScanGroup(ctx, groupID, prefix, perGroupLimit)
+			results[idx] = scanResult{items: items, err: scanErr}
+		}(i, gid)
+	}
+	wg.Wait()
+
+	// 检查错误
 	all := make([]*pb.KeyValue, 0)
-	for _, gid := range gids {
-		items, err := r.ScanGroup(ctx, gid, prefix, 0)
-		if err != nil {
-			return nil, err
+	for _, res := range results {
+		if res.err != nil {
+			return nil, res.err
 		}
-		all = append(all, items...)
+		all = append(all, res.items...)
 	}
 
 	sort.Slice(all, func(i, j int) bool {

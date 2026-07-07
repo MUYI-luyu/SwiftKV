@@ -1,4 +1,4 @@
-package rsm
+package kv
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"kvraft/pkg/kv"
 	"kvraft/pkg/raft"
 	"kvraft/pkg/wal"
 	"kvraft/pkg/watch"
@@ -28,19 +27,8 @@ func opEquals(a *Op, b *Op) bool {
 	return a.Me == b.Me && a.Id == b.Id
 }
 
-// OpCompleteListener 操作完成监听器接口
-// 用于在 Raft 日志提交后回调，例如触发 Watch 事件
-type OpCompleteListener interface {
-	// OnOpComplete 在操作被 Raft 提交和应用后调用
-	// req: 原始请求
-	// result: 操作结果
-	// index: Raft 日志索引
-	OnOpComplete(req any, result any, index int64)
-}
-
-// StateMachine 是状态机接口。需要复制自身的服务器应调用 MakeRSM 并实现本接口。
-// 该接口允许 rsm 包与应用层交互。应用层必须实现 DoOp 以执行操作（如 Get/Put 请求），
-// 并通过 Snapshot/Restore 实现快照功能以持久化和恢复服态。
+// StateMachine 是状态机接口。应用层必须实现 DoOp 以执行操作（如 Get/Put 请求），
+// 并通过 Snapshot/Restore 实现快照功能以持久化和恢复状态。
 type StateMachine interface {
 	DoOp(any) any
 	Snapshot() []byte
@@ -48,35 +36,27 @@ type StateMachine interface {
 }
 
 type waitingOp struct {
-	oper   Op        // 操作
-	result any       // 操作结果
-	done   chan bool // 操作完成的信号通道
+	oper   Op
+	result any
+	done   chan bool
 }
 
-type ApplyLoopPerfStats struct {
-	BlockedNanos    int64
-	ProcessNanos    int64
-	IterationCount  int64
-	BlockedAvgNanos float64
-	ProcessAvgNanos float64
-}
-
+// RSM 是复制状态机，管理 Raft 共识、快照、WAL 和 Watch 的生命周期。
 type RSM struct {
 	mu            sync.Mutex
 	me            int
 	rf            raft.Node
 	applyCh       chan raft.ApplyMsg
-	maxraftstate  int // 当 Raft 日志大小超过此值时触发快照
+	maxraftstate  int
 	sm            StateMachine
 	persister     raft.Persister
 	idCounter     int64
-	waitingOps    map[int]*waitingOp // 正在等待的操作，key 是日志索引
+	waitingOps    map[int]*waitingOp
 	shutdown      atomic.Bool
-	watchMgr      *watch.Manager     // Watch 管理器
-	opListener    OpCompleteListener // 操作完成监听器（用于 Watch 回调）
+	watchMgr      *watch.Manager
+	opListener    OpCompleteListener
 	walLogger     *wal.Logger
 	leaseRead     atomic.Bool
-	snapshotInFly atomic.Bool
 	walGCInFly    atomic.Bool
 	lastSnapIndex int
 	lastApplied   int
@@ -88,6 +68,7 @@ type RSM struct {
 	applyLoopProcessNanos int64
 	applyLoopIterCount    int64
 }
+
 
 func leaseReadEnabledFromEnv() bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("KV_LEASE_READ")))
@@ -148,14 +129,13 @@ func (rsm *RSM) Close() {
 	rsm.waitingOps = make(map[int]*waitingOp)
 }
 
-// MakeRSM 创建复制状态机实例。
-// MakeRSM 应快速返回，由后台 goroutine 进行长期运行的工作。
+// MakeRSM 创建复制状态机实例。应快速返回，后台 goroutine 进行长期运行的工作。
 func MakeRSM(
-	peers []string, // Raft 集群中各节点的网络地址
-	me int, // 当前节点在 peers 中的下标
-	persister raft.Persister, // 用于持久化 Raft 状态和快照的存储器
-	maxraftstate int, // 当 Raft 日志大小达到此值时触发快照（-1 表示不启用快照）
-	sm StateMachine, // 应用层实现的状态机
+	peers []string,
+	me int,
+	persister raft.Persister,
+	maxraftstate int,
+	sm StateMachine,
 ) *RSM {
 	rsm := &RSM{
 		me:           me,
@@ -171,9 +151,8 @@ func MakeRSM(
 	}
 	rsm.shutdown.Store(false)
 	rsm.leaseRead.Store(leaseReadEnabledFromEnv())
-	// 根据当前节点 ID 生成预写日志（WAL）的绝对路径
 	walPath := filepath.Join(runtimeDataRoot(), "wal", fmt.Sprintf("rsm-node-%d.log", me))
-	walEnabled := boolEnvDefault("KV_WAL_ENABLED", true)
+	walEnabled := boolEnvDefault("KV_WAL_ENABLED", false)
 	walSync := boolEnvDefault("KV_WAL_SYNC", true)
 	walLogger, err := wal.NewLogger(walPath, walEnabled, walSync)
 	if err != nil {
@@ -219,8 +198,27 @@ func (rsm *RSM) genID() int64 {
 	return atomic.AddInt64(&rsm.idCounter, 1)
 }
 
-func (rsm *RSM) Raft() raft.Node {
-	return rsm.rf
+func (rsm *RSM) IsLeaderWithLease() bool {
+	if rf, ok := rsm.rf.(*raft.Raft); ok {
+		return rf.IsLeaderWithLease()
+	}
+	_, isLeader := rsm.rf.GetState()
+	return isLeader
+}
+
+func (rsm *RSM) RaftPerfStatsSnapshot() raft.RaftPerfStats {
+	if rf, ok := rsm.rf.(*raft.Raft); ok {
+		return rf.PerfStatsSnapshot()
+	}
+	return raft.RaftPerfStats{}
+}
+
+func (rsm *RSM) GetState() (int, bool) {
+	return rsm.rf.GetState()
+}
+
+func (rsm *RSM) GetLastApplied() int {
+	return rsm.rf.GetLastApplied()
 }
 
 func (rsm *RSM) EnableLeaseRead(enable bool) {
@@ -228,36 +226,26 @@ func (rsm *RSM) EnableLeaseRead(enable bool) {
 }
 
 // SubmitLeaseRead tries local lease read first, then falls back to consensus path.
-func (rsm *RSM) SubmitLeaseRead(req any) (kv.Err, any) {
+func (rsm *RSM) SubmitLeaseRead(req any) (Err, any) {
 	err, ret, _ := rsm.SubmitLeaseReadWithMode(req)
 	return err, ret
 }
 
 // SubmitLeaseReadWithMode returns whether the request was served via local lease read.
-func (rsm *RSM) SubmitLeaseReadWithMode(req any) (kv.Err, any, bool) {
-	// 检查是否开启租约功能
+func (rsm *RSM) SubmitLeaseReadWithMode(req any) (Err, any, bool) {
 	if !rsm.leaseRead.Load() {
 		err, ret := rsm.Submit(req)
 		return err, ret, false
 	}
-	// 转换为 Raft 实现类
-	rfImpl, ok := rsm.rf.(*raft.Raft)
-	if !ok {
-		err, ret := rsm.Submit(req)
-		return err, ret, false
-	}
-	// 在租约期内直接读取本地数据
-	if rfImpl.IsLeaderWithLease() {
+	if rsm.IsLeaderWithLease() {
 		result := rsm.sm.DoOp(req)
-		return kv.OK, result, true
+		return OK, result, true
 	}
 	err, ret := rsm.Submit(req)
 	return err, ret, false
 }
 
 // reqPtr normalizes a request value to its pointer form for uniform type switching.
-// If v is already *T, returns it as-is; if v is T, returns &v.
-// Returns nil if v is neither T nor *T.
 func reqPtr[T any](v any) *T {
 	switch t := v.(type) {
 	case T:
@@ -278,25 +266,25 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		Timestamp: time.Now().UnixNano(),
 	}
 	switch oper.Req.(type) {
-	case *kv.GetArgs, kv.GetArgs:
-		t := reqPtr[kv.GetArgs](oper.Req)
+	case *GetArgs, GetArgs:
+		t := reqPtr[GetArgs](oper.Req)
 		entry.OpType = "GET"
 		entry.Key = t.Key
-	case *kv.ScanArgs, kv.ScanArgs:
+	case *ScanArgs, ScanArgs:
 		entry.OpType = "SCAN"
-	case *kv.PutArgs, kv.PutArgs:
-		t := reqPtr[kv.PutArgs](oper.Req)
+	case *PutArgs, PutArgs:
+		t := reqPtr[PutArgs](oper.Req)
 		entry.OpType = "PUT"
 		entry.Key = t.Key
 		entry.Value = t.Value
 		entry.Version = int64(t.Version)
 		entry.TTL = t.TTL
-	case *kv.DeleteArgs, kv.DeleteArgs:
-		t := reqPtr[kv.DeleteArgs](oper.Req)
+	case *DeleteArgs, DeleteArgs:
+		t := reqPtr[DeleteArgs](oper.Req)
 		entry.OpType = "DELETE"
 		entry.Key = t.Key
-	case *kv.ExpireArgs, kv.ExpireArgs:
-		t := reqPtr[kv.ExpireArgs](oper.Req)
+	case *ExpireArgs, ExpireArgs:
+		t := reqPtr[ExpireArgs](oper.Req)
 		entry.OpType = "EXPIRE"
 		entry.Keys = append([]string(nil), t.Keys...)
 		entry.Cutoff = t.Cutoff
@@ -314,21 +302,20 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 	case "SCAN":
 		return nil, false, nil
 	case "PUT":
-		return &kv.PutArgs{
+		return &PutArgs{
 			Key:     entry.Key,
 			Value:   entry.Value,
-			Version: kv.Tversion(entry.Version),
+			Version: Tversion(entry.Version),
 			TTL:     entry.TTL,
 		}, true, nil
 	case "DELETE":
-		return &kv.DeleteArgs{Key: entry.Key}, true, nil
+		return &DeleteArgs{Key: entry.Key}, true, nil
 	case "EXPIRE":
-		return &kv.ExpireArgs{
+		return &ExpireArgs{
 			Keys:   append([]string(nil), entry.Keys...),
 			Cutoff: entry.Cutoff,
 		}, true, nil
 	default:
-		// 兼容历史 WAL 中 default fmt(%T) 记录的只读操作类型。
 		if strings.Contains(entry.OpType, "GetArgs") || strings.Contains(entry.OpType, "ScanArgs") {
 			return nil, false, nil
 		}
@@ -384,7 +371,6 @@ func (rsm *RSM) GetWatchManager() *watch.Manager {
 }
 
 // RegisterOpCompleteListener 注册操作完成监听器
-// 监听器会在每个操作被 Raft 提交和应用后被调用
 func (rsm *RSM) RegisterOpCompleteListener(listener OpCompleteListener) {
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
@@ -413,17 +399,19 @@ func (rsm *RSM) ApplyLoopPerfStatsSnapshot() ApplyLoopPerfStats {
 }
 
 // Submit 向 Raft 提交一条命令并等待其被提交。
-// 如果当前节点不是 Leader，返回 ErrWrongLeader，客户端应重新查找 Leader 后重试。
-func (rsm *RSM) Submit(req any) (kv.Err, any) {
+// 包含 per-key 冲突检测：如果该 key 已有待处理写操作，直接返回 ErrVersion 避免无效的 Raft 提案。
+// Submit 向 Raft 提交一条命令并等待其被提交。
+// 如果当前节点不是 Leader，返回 ErrWrongLeader；客户端应重新查找 Leader 后重试。
+func (rsm *RSM) Submit(req any) (Err, any) {
 	if rsm.shutdown.Load() {
-		return kv.ErrWrongLeader, nil
+		return ErrWrongLeader, nil
 	}
 
 	opID := rsm.genID()
 	oper := Op{Me: rsm.me, Id: opID, Req: req}
 	index, _, isLeader := rsm.rf.Start(oper)
 	if !isLeader {
-		return kv.ErrWrongLeader, nil
+		return ErrWrongLeader, nil
 	}
 	waitingOp := &waitingOp{
 		oper: oper,
@@ -439,22 +427,21 @@ func (rsm *RSM) Submit(req any) (kv.Err, any) {
 	rsm.waitingOps[index] = waitingOp
 	rsm.mu.Unlock()
 
-	err, result := func() (kv.Err, any) {
+	err, result := func() (Err, any) {
 		timer := time.NewTimer(1500 * time.Millisecond)
 		defer timer.Stop()
 		for {
 			if rsm.shutdown.Load() {
-				return kv.ErrWrongLeader, nil
+				return ErrWrongLeader, nil
 			}
 			select {
 			case <-timer.C:
-				// 超时，返回错误
-				return kv.ErrWrongLeader, nil
+				return ErrWrongLeader, nil
 			case res := <-waitingOp.done:
 				if res {
-					return kv.OK, waitingOp.result
+					return OK, waitingOp.result
 				} else {
-					return kv.ErrWrongLeader, nil
+					return ErrWrongLeader, nil
 				}
 			}
 		}
@@ -505,7 +492,6 @@ func (rsm *RSM) applyLoop() {
 func (rsm *RSM) applyCommand(msg raft.ApplyMsg) {
 	oper, ok := msg.Command.(Op)
 	if !ok {
-		// 非法的操作类型，忽略
 		return
 	}
 
@@ -523,14 +509,11 @@ func (rsm *RSM) applyCommand(msg raft.ApplyMsg) {
 	}
 	rsm.mu.Unlock()
 
-	// 关键：在状态机应用操作后，立即调用监听器
-	// 这确保 Watch 事件的线性一致性（在 CommandValid 之后）
 	rsm.mu.Lock()
 	listener := rsm.opListener
 	rsm.mu.Unlock()
 
 	if listener != nil {
-		// 异步调用监听器，避免阻塞 apply loop
 		go listener.OnOpComplete(oper.Req, result, int64(msg.CommandIndex))
 	}
 
@@ -543,7 +526,6 @@ func (rsm *RSM) applyCommand(msg raft.ApplyMsg) {
 			default:
 			}
 		} else {
-			// 操作被覆盖
 			select {
 			case wop.done <- false:
 			default:
@@ -553,9 +535,8 @@ func (rsm *RSM) applyCommand(msg raft.ApplyMsg) {
 	rsm.mu.Unlock()
 
 	if rsm.shouldCreateSnapshot(msg.CommandIndex) {
-		if rsm.snapshotInFly.CompareAndSwap(false, true) {
-			go rsm.createSnapshot(msg.CommandIndex)
-		}
+		rsm.lastSnapAt = time.Now()
+		go rsm.createSnapshot(msg.CommandIndex)
 	}
 }
 
@@ -606,7 +587,6 @@ func (rsm *RSM) applySnapshot(msg raft.ApplyMsg) {
 }
 
 func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
-	defer rsm.snapshotInFly.Store(false)
 	if rsm.shutdown.Load() {
 		return
 	}

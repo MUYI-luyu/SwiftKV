@@ -1,4 +1,4 @@
-package rsm
+package persister
 
 import (
 	"encoding/binary"

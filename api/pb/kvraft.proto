@@ -19,6 +19,10 @@ service KVService {
 
   // 集群状态
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+
+  // 分片管理（迁移用）
+  rpc SetShardState(SetShardStateRequest) returns (SetShardStateResponse);
+  rpc GetShardStates(GetShardStatesRequest) returns (GetShardStatesResponse);
 }
 
 // ============ 基础操作 ============
@@ -104,6 +108,8 @@ message ClusterStatusResponse {
   repeated NodeStatus nodes = 2;
   int64 current_term = 3;
   int64 last_applied = 4;
+  int32 group_id = 5;
+  int64 topology_epoch = 6;
 }
 
 message NodeStatus {
@@ -111,4 +117,37 @@ message NodeStatus {
   string address = 2;
   bool is_leader = 3;
   bool is_alive = 4;
+}
+
+// ============ 分片迁移 ============
+
+enum ShardState {
+  OWNED = 0;      // 正常：本 group 拥有此 shard
+  MIGRATING = 1;  // 迁出中：本 group 仍在服务，但写操作需转发到目标 group
+  IMPORTING = 2;  // 迁入中：本 group 正在接收此 shard
+  ABSENT = 3;     // 不拥有：shard 已迁移走，拒绝所有请求
+}
+
+message SetShardStateRequest {
+  int32 shard_id = 1;
+  ShardState state = 2;
+  int32 target_group = 3;   // MIGRATING 时双写的目标 group
+  int64 topology_epoch = 4; // 新的拓扑版本号
+}
+
+message SetShardStateResponse {
+  string error = 1;
+}
+
+message ShardStateEntry {
+  int32 shard_id = 1;
+  ShardState state = 2;
+  int32 target_group = 3;
+}
+
+message GetShardStatesRequest {}
+
+message GetShardStatesResponse {
+  repeated ShardStateEntry states = 1;
+  int64 topology_epoch = 2;
 }

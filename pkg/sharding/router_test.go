@@ -140,13 +140,15 @@ func startTestKVServer(t *testing.T, svc *testKVService) (addr string, stop func
 
 func findKeyForGroup(t *testing.T, r *ShardRouter, gid int, prefix string) string {
 	t.Helper()
-	for i := 0; i < 5000; i++ {
+	// Shard 拓扑下每个 group 拥有约 numShards/numGroups 的 shard，
+	// 随机 key 命中目标 group 的概率 ≈ 1/numGroups，平均只需数次尝试。
+	for i := 0; i < 200; i++ {
 		k := fmt.Sprintf("%s-%d", prefix, i)
 		if r.Resolve(k) == gid {
 			return k
 		}
 	}
-	t.Fatalf("cannot find key for group %d", gid)
+	t.Fatalf("cannot find key for group %d (prefix=%s, tried 200)", gid, prefix)
 	return ""
 }
 

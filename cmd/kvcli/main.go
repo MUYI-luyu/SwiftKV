@@ -15,7 +15,6 @@ import (
 
 	pb "kvraft/api/pb/kvraft/api/pb"
 	"kvraft/pkg/kv"
-	"kvraft/pkg/rsm"
 	"kvraft/pkg/sharding"
 )
 
@@ -122,7 +121,7 @@ func main() {
 	shardingConfig := flag.String("sharding-config", "", "path to sharding config json for sharded mode")
 	flag.Parse()
 
-	var ck *rsm.Clerk
+	var ck *kv.Clerk
 	var err error
 	meta := loadRuntimeMetadata()
 	mode := "single-raft"
@@ -150,14 +149,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "load sharding config failed: %v\n", cfgErr)
 			os.Exit(1)
 		}
-		ck, err = rsm.MakeShardedClerk(cfg)
+		ck, err = kv.MakeShardedClerk(cfg)
 		mode = "sharded"
 	} else {
 		servers := strings.Split(resolvedServers, ",")
 		for i := range servers {
 			servers[i] = strings.TrimSpace(servers[i])
 		}
-		ck = rsm.MakeClerk(servers)
+		ck = kv.MakeClerk(servers)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create clerk failed: %v\n", err)
@@ -169,7 +168,7 @@ func main() {
 	printHelp()
 
 	var outMu sync.Mutex
-	watchers := map[int]*rsm.WatchSubscription{}
+	watchers := map[int]*kv.WatchSubscription{}
 	nextWatchID := 1
 	localVersion := map[string]kv.Tversion{}
 

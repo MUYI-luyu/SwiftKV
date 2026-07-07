@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
@@ -21,6 +23,36 @@ type kvEntry struct {
 type Store struct {
 	db     *badger.DB
 	dbPath string
+
+	// TTL 最小堆：按过期时间排序，避免全表扫描
+	expiryHeap expiryHeap
+	expiryMu   sync.Mutex
+	tombstones map[string]bool // 已删除的 key，在堆顶弹出时跳过
+}
+
+// expiryItem 是 TTL 堆中的一个条目
+type expiryItem struct {
+	key     string
+	expires int64
+}
+
+// expiryHeap 实现 container/heap.Interface，按 expires 升序排列（最小堆）
+type expiryHeap []expiryItem
+
+func (h expiryHeap) Len() int           { return len(h) }
+func (h expiryHeap) Less(i, j int) bool { return h[i].expires < h[j].expires }
+func (h expiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *expiryHeap) Push(x any) {
+	*h = append(*h, x.(expiryItem))
+}
+
+func (h *expiryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
 type PutCASStatus int
@@ -55,9 +87,29 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 
 	return &Store{
-		db:     db,
-		dbPath: dbPath,
+		db:         db,
+		dbPath:     dbPath,
+		tombstones: make(map[string]bool),
+		expiryHeap: make(expiryHeap, 0),
 	}, nil
+}
+
+// trackExpiry 将带有 TTL 的 key 推入过期堆
+func (s *Store) trackExpiry(key string, expires int64) {
+	if expires <= 0 {
+		return
+	}
+	s.expiryMu.Lock()
+	delete(s.tombstones, key) // 清除可能存在的 tombstone
+	heap.Push(&s.expiryHeap, expiryItem{key: key, expires: expires})
+	s.expiryMu.Unlock()
+}
+
+// markTombstone 标记 key 为已删除，当它出现在堆顶时将被跳过
+func (s *Store) markTombstone(key string) {
+	s.expiryMu.Lock()
+	s.tombstones[key] = true
+	s.expiryMu.Unlock()
 }
 
 // Get 返回一个键的值、版本号和绝对过期时间戳。
@@ -168,11 +220,48 @@ func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires
 		return txn.Set([]byte(key), data)
 	})
 
+	// 写入成功后，将 key 加入 TTL 堆（用于高效过期扫描）
+	if err == nil && status == PutCASOK && expires > 0 {
+		s.trackExpiry(key, expires)
+	}
 	return oldValue, status, err
 }
 
-// GetExpiredKeys 返回所有过期时间 <= cutoff 阀值的键。
+// PeekExpiredKeys 从 TTL 堆中获取所有过期时间 <= cutoff 的键（最多 limit 个）。
+// 相比全表扫描 GetExpiredKeys，此方法复杂度为 O(K log N)，其中 K 为过期键数。
+func (s *Store) PeekExpiredKeys(cutoff int64, limit int) []string {
+	if limit <= 0 {
+		limit = 128
+	}
+	s.expiryMu.Lock()
+	defer s.expiryMu.Unlock()
+
+	keys := make([]string, 0, limit)
+	for s.expiryHeap.Len() > 0 && len(keys) < limit {
+		top := s.expiryHeap[0]
+		if top.expires > cutoff {
+			break // 堆顶未过期，后续都未过期
+		}
+		heap.Pop(&s.expiryHeap)
+
+		// 跳过已删除的 key（tombstone）
+		if s.tombstones[top.key] {
+			delete(s.tombstones, top.key)
+			continue
+		}
+		keys = append(keys, top.key)
+	}
+	return keys
+}
+
+// GetExpiredKeys 保留原有签名，内部委托给堆实现以获取 O(K log N) 性能。
+// 如果堆为空（例如冷启动时尚未重建），退化为全表扫描。
 func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
+	// 优先使用堆
+	if s.expiryHeap.Len() > 0 {
+		return s.PeekExpiredKeys(cutoff, limit), nil
+	}
+	// 冷启动退化为全表扫描
 	if limit <= 0 {
 		limit = 128
 	}
@@ -205,11 +294,86 @@ func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
 	return keys, err
 }
 
-// Delete 从存储中删除一个键
+// RebuildExpiryHeap 从 BadgerDB 全量重建 TTL 堆（用于启动和快照恢复后）。
+func (s *Store) RebuildExpiryHeap() error {
+	s.expiryMu.Lock()
+	defer s.expiryMu.Unlock()
+
+	s.expiryHeap = make(expiryHeap, 0)
+	s.tombstones = make(map[string]bool)
+
+	return s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			var entry kvEntry
+			if err := json.Unmarshal(val, &entry); err != nil {
+				continue
+			}
+			if entry.Expires > 0 {
+				heap.Push(&s.expiryHeap, expiryItem{
+					key:     string(item.Key()),
+					expires: entry.Expires,
+				})
+			}
+		}
+		return nil
+	})
+}
+
+// ScanPrefix 使用 Badger 前缀迭代器扫描匹配前缀的键值对。
+// 相比 GetAll() + 应用层过滤，此方法仅访问匹配前缀的键，复杂度为 O(匹配键数)。
+// limit <= 0 表示不限制。
+func (s *Store) ScanPrefix(prefix string, limit int) ([]kvEntry, []string, error) {
+	entries := make([]kvEntry, 0)
+	keys := make([]string, 0)
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		if prefix != "" {
+			opts.Prefix = []byte(prefix)
+		}
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			if limit > 0 && len(keys) >= limit {
+				break
+			}
+			item := it.Item()
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			var entry kvEntry
+			if err := json.Unmarshal(val, &entry); err != nil {
+				continue
+			}
+			entries = append(entries, entry)
+			keys = append(keys, string(item.Key()))
+		}
+		return nil
+	})
+	return entries, keys, err
+}
+
+// Delete 从存储中删除一个键，并标记 tombstone 以在 TTL 堆中跳过
 func (s *Store) Delete(key string) error {
-	return s.db.Update(func(txn *badger.Txn) error {
+	err := s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
+	if err == nil {
+		s.markTombstone(key)
+	}
+	return err
 }
 
 // GetAll 获取所有键值对（用于加载快照或导出）

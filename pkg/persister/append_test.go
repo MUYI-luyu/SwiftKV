@@ -1,12 +1,22 @@
-package rsm
+package persister
 
 import (
 	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+func persisterTestStorePath(t *testing.T, name string) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "data", "test", "persister", name)
+}
 
 func buildTestAppendPayload(prevState []byte, newHeader []byte, delta []byte) []byte {
 	payload := make([]byte, raftAppendPayloadHeaderSize+len(newHeader)+len(delta))
@@ -21,7 +31,7 @@ func buildTestAppendPayload(prevState []byte, newHeader []byte, delta []byte) []
 }
 
 func TestPersisterAppendRaftStateRoundTrip(t *testing.T) {
-	dataDir := rsmTestStorePath(t, "test-persister-append-roundtrip")
+	dataDir := persisterTestStorePath(t, "test-persister-append-roundtrip")
 	fp, err := NewFilePersister(dataDir)
 	if err != nil {
 		t.Fatalf("create persister failed: %v", err)
@@ -44,7 +54,7 @@ func TestPersisterAppendRaftStateRoundTrip(t *testing.T) {
 }
 
 func TestPersisterAppendRaftStateIgnoresPartialTailFrame(t *testing.T) {
-	dataDir := rsmTestStorePath(t, "test-persister-append-partial-tail")
+	dataDir := persisterTestStorePath(t, "test-persister-append-partial-tail")
 	fp, err := NewFilePersister(dataDir)
 	if err != nil {
 		t.Fatalf("create persister failed: %v", err)
@@ -78,7 +88,7 @@ func TestPersisterAppendRaftStateIgnoresPartialTailFrame(t *testing.T) {
 }
 
 func TestPersisterAppendCompactsToNewBase(t *testing.T) {
-	dataDir := rsmTestStorePath(t, "test-persister-append-compact")
+	dataDir := persisterTestStorePath(t, "test-persister-append-compact")
 	fp, err := NewFilePersister(dataDir)
 	if err != nil {
 		t.Fatalf("create persister failed: %v", err)

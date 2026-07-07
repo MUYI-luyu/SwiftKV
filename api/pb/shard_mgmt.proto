@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "kvraft/api/pb/kvraft/api/pb";
+
+enum ShardState {
+  OWNED = 0;
+  MIGRATING = 1;
+  IMPORTING = 2;
+  ABSENT = 3;
+}
+
+message SetShardStateRequest {
+  int32 shard_id = 1;
+  ShardState state = 2;
+  int32 target_group = 3;
+  int64 topology_epoch = 4;
+}
+
+message SetShardStateResponse {
+  string error = 1;
+}
+
+message ShardStateEntry {
+  int32 shard_id = 1;
+  ShardState state = 2;
+  int32 target_group = 3;
+}
+
+message GetShardStatesRequest {}
+
+message GetShardStatesResponse {
+  repeated ShardStateEntry states = 1;
+  int64 topology_epoch = 2;
+}
