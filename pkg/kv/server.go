@@ -149,6 +149,15 @@ func (kv *KVServer) doGet(args *GetArgs) GetReply {
 	if kv.killed() {
 		return GetReply{Err: ErrWrongLeader}
 	}
+
+	// shard 状态检查
+	shardID := kv.shardForKey(args.Key)
+	if meta, ok := kv.shardMgr.GetShardState(shardID); ok {
+		if meta.state == pb.ShardState_ABSENT {
+			return GetReply{Err: ErrWrongGroup}
+		}
+	}
+
 	now := time.Now().UnixNano()
 	value, version, expires, exists, err := kv.store.Get(args.Key)
 	if err != nil {
