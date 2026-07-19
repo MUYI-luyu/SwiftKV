@@ -155,7 +155,6 @@ func main() {
 
 	kvServer := kv.StartKVServer(servers, groupID, nodeID, fp, maxRaftState, rpcAddr)
 	log.Printf("kvraft node started: node_id=%d group_id=%d rpc=%s rest=%s metrics=%s pprof=%s", nodeID, groupID, rpcAddr, httpAddr, metricsAddr, pprofAddr)
-	log.Printf("kvraft node started: node_id=%d rpc=%s rest=%s metrics=%s pprof=%s", nodeID, rpcAddr, httpAddr, metricsAddr, pprofAddr)
 
 	httpSrv := startHTTP(httpAddr, kvServer)
 	metricsSrv := startMetricsHTTP(metricsAddr, kvServer)
