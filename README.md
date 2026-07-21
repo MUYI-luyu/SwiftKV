@@ -1,183 +1,179 @@
 # SwiftKV
 
-**SwiftKV** 是一款基于 Go 语言开发的高性能分布式 Key-Value 存储系统。系统以 **Raft 共识协议** 为核心实现强一致性保障，并支持基于**一致性哈希分片**的多 Raft 组横向扩展架构。
+> 基于自研 Raft 协议实现的分布式强一致性 KV 存储系统，支持多 Group 水平分片与在线安全迁移。
+
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
+[![gRPC](https://img.shields.io/badge/gRPC-1.79-244c5a?logo=google)](https://grpc.io/)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+---
 
 ## 核心特性
 
-1. **分布式一致性与架构**
+- **自研 Raft 共识** — 选举、日志复制、快照压缩及崩溃恢复。异步持久化流水线解耦磁盘 I/O 与共识路径，**租约读**绕过 Raft 共识往返降低读延迟。
+- **哈希槽分片路由** — 固定 1024 个哈希槽（类 Redis Cluster），xxhash 取模实现 O(1) Key→Group 路由，支持水平扩展与负载均衡。
+- **在线安全迁移** — 6 阶段 Shard 状态机（OWNED → MIGRATING → IMPORTING → ABSENT），迁移期间以双写保证 CP 语义，业务写入零中断。
+- **CAS 版本控制** — 乐观锁并发模型，Put 操作校验版本号，规避分布式环境下的丢失更新。
+- **Watch 事件订阅** — 基于 gRPC 双向流实现 Key/Prefix 级变更推送，Leader 感知自动重连。
+- **TTL 过期治理** — 被动失效检测 + 最小堆主动扫描，精准清理过期键。
+- **全链路可观测** — 内置 Prometheus `/metrics` 端点暴露 QPS 与 Raft 运行状态，支持 pprof 火焰图。
 
-- **强一致状态机 (RSM)**：基于 Raft 协议实现线性一致性读写，确保分布式环境下数据绝对可靠。
-- **弹性分片路由 (Sharding)**：采用一致性哈希结合虚拟节点，支持动态扩容并实现请求的精准分发。
-- **工业级容灾恢复**：支持分段 **WAL** 与 **Snapshot** 机制，大幅提升冷启动恢复速度并优化日志压缩。
-
-2. **高级存储语义**
-- **多维订阅 (Watch)**：基于 gRPC Stream 实现 Key/Prefix 级别的变更订阅，支持 Leader 感知的自动重连。
-- **并发控制 (CAS)**：提供基于版本的原子 Compare-and-Swap 操作，通过乐观锁机制规避分布式环境下的“丢失更新”问题。
-- **租约与生命周期 (TTL/Lease)**：内置 Lease 机制提供分布式锁基础能力，结合“被动失效+主动扫描”实现精准的 TTL 治理。
-
-3. **工程化与可观测性**
-- **高性能通信**：全链路采用 **gRPC** 协议，提供统一的读写、配置管理及集群状态监控接口。
-- **全链路可观测性**：内置 Prometheus 标准的 /metrics 接口，实时暴露 QPS、延迟分布及 Raft 运行状态。
+---
 
 ## 快速开始
 
-### 1. 环境要求
+### 环境要求
 
-- Linux 或 macOS
+- Linux / macOS
 - Go 1.25+
-- Git
 
-### 2. 拉取与编译
+### 构建
 
 ```bash
 git clone git@github.com:jianger-yu/KVraft.git
 cd KVraft
-go mod tidy
 go build ./...
 ```
 
-### 3. 启动 3 节点集群
+### 启动集群
 
 ```bash
-bash scripts/run_cluster.sh
+# 单 Raft 组（3 副本）
+bash scripts/run_cluster.sh --arch node-ring --servers 3 --clean
+
+# 多 Group 分片（3 Group × 3 Replica = 9 节点）
+bash scripts/run_cluster.sh --arch group-ring --groups 3 --replicas 3 --clean
 ```
 
-默认节点：
+### 使用客户端
 
-- 127.0.0.1:15000
-- 127.0.0.1:15001
-- 127.0.0.1:15002
+```go
+import "kvraft/pkg/kv"
 
-如需清理历史数据后重启：
+// 单 Group 模式
+ck := kv.MakeClerk([]string{"127.0.0.1:15000", "127.0.0.1:15001", "127.0.0.1:15002"})
+ck.Put("key", "value", 0)        // Create
+val, ver, _, _ := ck.Get("key")  // Read
+ck.Put("key", "newval", ver)     // Update (CAS)
+ck.Delete("key")                 // Delete
+```
+
+或使用 CLI：
 
 ```bash
-bash scripts/run_cluster.sh --clean
+go run cmd/kvcli/main.go                     # 交互式操作
+go run cmd/kvmigrate/main.go --dry-run       # 迁移计划预览
 ```
 
-可选运行模式（脚本参数映射）：
+### 性能压测
 
 ```bash
-# 模式 1：单 Raft 组
-# 参数映射：--arch node-ring
-bash scripts/run_cluster.sh --arch node-ring --servers 3 --base-port 15000 --clean
-
-# 模式 2：多 group 分片（按 group 做一致性哈希，脚本默认模式）
-# 参数映射：--arch group-ring
-bash scripts/run_cluster.sh --arch group-ring --groups 2 --replicas 3 --base-port 15000 --clean
+bash scripts/test_perf.sh --groups 1 --replicas 3
 ```
 
-说明：当前 `scripts/run_cluster.sh` 默认启动 `group-ring`（`--groups 1 --replicas 3`）。
-
-脚本会自动生成运行元数据与分片配置：
-
-- `data/cluster/runtime.env`
-- `data/cluster/sharding.json`
-
-### 4. 运行示例与 CLI
-
-```bash
-go run cmd/kvcli/main.go
-go run cmd/kvmigrate/main.go --dry-run
-```
-
-说明：`kvcli` 与 `kvmigrate` 在未传参时会优先读取 `data/cluster/runtime.env` 自动适配脚本启动的集群。
-
-## 推荐使用方式
-
-日常开发建议按这个顺序：
-
-1. 启动集群
-	- `bash scripts/run_cluster.sh --clean`
-2. 功能验证
-	- `go run cmd/kvcli/main.go`
-	- `go run cmd/kvmigrate/main.go --dry-run`
-3. 全量测试（精简输出）
-	- `bash scripts/test-all.sh`
-4. 性能压测
-	- `go build -o ./cmd/benchmarks/benchmark ./cmd/benchmarks/benchmark.go`
-	- `./cmd/benchmarks/benchmark --servers=3 --clients=10 --duration=30s --maxraftstate=1048576 --sharded=false`
-	- 多 group 分片模式建议：`--sharded=true --sharding-config=data/cluster/sharding.json`
-	- 连续压测若要避免历史数据干扰：`bash scripts/test_perf.sh --fresh-run true`
-5. 提交推送
-	- `bash push-to-github.sh -m "your message"`
-
-说明：`push-to-github.sh` 已接入 `scripts/test-all.sh`，测试输出只保留关键包状态和关键报错行。
+---
 
 ## 架构概览
 
-- `pkg/raft/`：Raft 共识（选主、日志复制、提交）
-- `pkg/rsm/`：复制状态机（请求编排、提交后应用）
-- `pkg/storage/`：BadgerDB 持久化封装
-- `pkg/watch/`：订阅与事件分发
-- `pkg/sharding/`：一致性哈希与路由
-- `pkg/kv/`：KV 业务类型定义（请求/响应结构体、错误码、版本号）
-- `pkg/wal/`：预写日志（WAL）分段管理
-- `api/pb/`：Proto 契约与生成代码
-- `cmd/`：可执行入口（server、kvcli、kvmigrate、benchmarks）
-
-### 架构形态
-
-- 单 Raft 组：一个共识组内多副本（常规 Raft 集群访问模式，客户端可使用 MakeClerk）
-- 多 group 分片：多个 Raft group 组成分片层，按 key 路由到 group（客户端可使用 MakeShardedClerk）
-
-
-## 当前能力边界
-
-### 已实现
-
-- Get / Put / Delete / Scan
-- CAS 版本控制
-- gRPC KVService（Get/Put/Delete/Scan/Watch/GetClusterStatus）
-- Watch key / Watch prefix
-- 单集群 + 分片路由访问
-- 分片迁移工具（kvmigrate）与路由重分配
-- 基础健康检查与指标导出（/health, /ready, /metrics）
-- 快照与持久化恢复主链路
-- WAL 分段化（提升恢复速度与日志管理能力）
-- TTL 到期治理（被动过期 + 主动清理）
-- Lease 租约（会话与分布式锁基础能力）
-- 配置连接池提供连接复用与并发压测优化
-
-## 数据目录说明
-
-默认情况下，运行数据写入 `data/`（或环境变量 `KV_DATA_DIR` 指定目录），典型结构如下：
-
-- `data/arch-node-ring/node-*/badger-127.0.0.1:PORT/`
-- `data/arch-group-ring/g*-n*/badger-127.0.0.1:PORT/`
-- `data/cluster/runtime.env`
-- `data/cluster/sharding.json`
-
-- 开发期保留：便于重启回放和问题复现
-- 演示前清理：使用 `bash scripts/run_cluster.sh --clean`
-
-## 测试与验证
-
-推荐执行全量测试（精简输出）：
-
-```bash
-bash scripts/test-all.sh
+```
+ Client (Clerk)                    Client (Clerk)
+      │                                  │
+      │  gRPC (KVService + ShardService) │
+      │                                  │
+  ┌───▼───────────────┐    ┌────────────▼───────────┐
+  │     Group 1       │    │       Group 2           │
+  │  ┌─────────────┐  │    │  ┌─────────────┐        │
+  │  │  Raft Node  │  │    │  │  Raft Node  │  ...   │
+  │  │ (Leader)    │◄─┼────┼─►│ (Leader)    │        │
+  │  └──────┬──────┘  │    │  └──────┬──────┘        │
+  │         │ Raft RPC│    │         │               │
+  │  ┌──────▼──────┐  │    │         │               │
+  │  │  KVServer   │  │    │         │               │
+  │  │ ┌──────────┐ │  │    │         │               │
+  │  │ │ ShardMgr │ │  │    │         │               │
+  │  │ │ (6-phase)│ │  │    │         │               │
+  │  │ └──────────┘ │  │    │         │               │
+  │  │ ┌──────────┐ │  │    │         │               │
+  │  │ │ BadgerDB │ │  │    │         │               │
+  │  │ └──────────┘ │  │    │         │               │
+  │  └──────────────┘  │    │         │               │
+  └────────────────────┘    └─────────────────────────┘
 ```
 
-如果你需要原始详细输出：
+### 模块说明
 
-```bash
-go test ./...
+| 包 | 职责 |
+|------|------|
+| `pkg/raft/` | Raft 共识：选举、日志复制、异步持久化、快照 |
+| `pkg/kv/` | KV 服务核心：Server、Clerk、RSM 桥接、gRPC、Shard 状态机 |
+| `pkg/sharding/` | 分片拓扑（1024 槽）、ShardRouter、在线迁移编排 |
+| `pkg/storage/` | 基于 BadgerDB 的持久化封装 |
+| `pkg/watch/` | Key/Prefix 变更订阅与事件分发 |
+| `pkg/wal/` | 预写日志分段管理 |
+| `pkg/persister/` | Raft 持久化文件 I/O |
+| `api/pb/` | Protobuf 契约与生成代码 |
+| `cmd/` | 入口：server / kvcli / kvmigrate / benchmarks |
+
+### 写入路径
+
+```
+Clerk.Put(key, value, ver)
+  │
+  ▼
+ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──► KVServer
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │ Shard 状态检查     │
+                                                    │ OWNED → 本地写     │
+                                                    │ MIGRATING → 双写   │
+                                                    │ ABSENT → 重定向    │
+                                                    └─────────┬─────────┘
+                                                              │
+                                              Raft.Submit ──► 日志复制 ──► Commit
+                                                              │
+                                              BadgerDB.PutCASWithTTL ◄────┘
 ```
 
-## Docker 说明
+### 读取路径（租约优化）
 
-容器相关文件位于 `deployments/`：
-
-- `deployments/Dockerfile`
-- `deployments/Dockerfile.benchmark`
-- `deployments/docker-compose.yml`
-- `deployments/prometheus.yml`
-
-当前配置已经对齐当前代码结构，可直接在仓库根目录执行：
-
-```bash
-docker-compose -f deployments/docker-compose.yml up --build
+```
+Clerk.Get(key)
+  │
+  ▼
+ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──► Leader?
+                                                              │
+                                              ┌─ Lease 有效？──► 本地读（无 Raft 往返）
+                                              │
+                                              └─ Lease 过期 ──► Raft 共识读
 ```
 
-- 如果你的环境还没有 Docker，请先安装 Docker Engine 和 Docker Compose 插件，再执行上面的命令。
-- 若用于生产部署，建议先检查端口映射、数据卷、资源限制和监控策略。
+---
+
+## 在线迁移流程
+
+```
+Phase 1: Target ← IMPORTING       目标准备接收
+Phase 2: Source ← MIGRATING       双写开始（本地 + 转发 target）
+Phase 3: bulkCopy                 批量同步存量数据
+Phase 4: Target ← OWNED          目标成为正式 owner，双写结束
+Phase 5: Source ← ABSENT         源停止服务该 shard
+Phase 6: Clean                    清理源上过期数据
+```
+
+---
+
+## 脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `run_cluster.sh` | 启动本地集群（支持 node-ring / group-ring 两种模式） |
+| `stop_cluster.sh` | 停止集群 |
+| `check_status.sh` | 查看各节点 Leader / Term 状态 |
+| `test_all.sh` | 全量单元测试 |
+| `test_perf.sh` | 自动化性能压测并保存报告 |
+
+---
+
+## License
+
+MIT
