@@ -1,0 +1,51 @@
+# ============================================================
+# Docker 构建忽略文件
+# 这些文件/目录不会被传入 Docker build context，大幅减小传输体积
+# ============================================================
+
+# 运行时数据（527MB+）
+data/
+
+# 文档与设计
+docs/
+.continue/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 测试与覆盖率
+*.test
+*.out
+coverage/
+coverage.txt
+*.prof
+*.pprof
+
+# 编译产物
+kvraft-server
+kvcli
+benchmark
+cmd/server/server
+cmd/kvcli/kvcli
+cmd/benchmarks/benchmark
+
+# 压缩包
+*.tar
+*.tar.gz
+*.zip
+
+# 临时文件
+tmp/
+temp/
+*.log
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/

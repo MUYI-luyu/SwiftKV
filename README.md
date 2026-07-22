@@ -4,6 +4,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
 [![gRPC](https://img.shields.io/badge/gRPC-1.79-244c5a?logo=google)](https://grpc.io/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://docs.docker.com/compose/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ---
@@ -37,6 +38,8 @@ go build ./...
 
 ### 启动集群
 
+**方式一：脚本（本地开发）**
+
 ```bash
 # 单 Raft 组（3 副本）
 bash scripts/run_cluster.sh --arch node-ring --servers 3 --clean
@@ -44,6 +47,25 @@ bash scripts/run_cluster.sh --arch node-ring --servers 3 --clean
 # 多 Group 分片（3 Group × 3 Replica = 9 节点）
 bash scripts/run_cluster.sh --arch group-ring --groups 3 --replicas 3 --clean
 ```
+
+**方式二：Docker Compose（一键部署 + 监控）**
+
+```bash
+# 启动 3 节点集群 + Prometheus + Grafana
+docker compose -f deployments/docker-compose.yml up -d
+
+# 跑压测
+docker compose -f deployments/docker-compose.yml --profile benchmark up benchmark
+
+# 停止
+docker compose -f deployments/docker-compose.yml down
+```
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| KVraft 节点 (×3) | 6000-6002 (gRPC) / 8001-8003 (REST) | Raft 集群 |
+| Prometheus | 9090 | 指标采集 |
+| Grafana | 3000 (admin/admin) | 可视化面板 |
 
 ### 使用客户端
 
@@ -146,6 +168,19 @@ ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──�
                                               │
                                               └─ Lease 过期 ──► Raft 共识读
 ```
+
+### 性能基准
+
+> 3 节点 Docker 集群，10 客户端 × 10,000 请求
+
+| 负载 | 吞吐 | 延迟 (avg/P99) |
+|------|------|----------------|
+| 纯读 | **52,179 ops/s** | 0.19ms / 0.50ms |
+| 纯写 | 1,948 ops/s | 5.13ms / 12.42ms |
+| 混合读/写 (50/50) | 3,905 ops/s | 2.53ms / 6.09ms |
+
+- **读比写快 27 倍** — 租约读跳过 Raft 往返，直达 BadgerDB，纯读延迟仅 0.19ms；瓶颈在 gRPC 序列化（BadgerDB 查询仅占 ~5µs），而非存储引擎
+- **写上限 ~2k ops/s** — 三副本日志同步是分布式一致性的代价，并非 Go 或 BadgerDB 限制
 
 ---
 

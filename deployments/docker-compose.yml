@@ -1,24 +1,9 @@
-version: '3.8'
-
 # ============================================================
 # KVraft 集群部署配置
-# 支持：3 节点 Raft 集群、gRPC 服务、Prometheus 监控
+# 默认启动 3 节点单 Raft 组 + Prometheus + Grafana
 # ============================================================
 
 services:
-  # 配置中心和服务注册
-  consul:
-    image: consul:1.15
-    container_name: kvraft-consul
-    ports:
-      - "8500:8500"
-      - "8600:8600/udp"
-    environment:
-      - CONSUL_BIND_INTERFACE=eth0
-    command: agent -server -ui -bootstrap-expect=1 -client=0.0.0.0
-    networks:
-      - kvraft-net
-
   # Prometheus 监控服务
   prometheus:
     image: prom/prometheus:latest
@@ -47,7 +32,6 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:
@@ -56,10 +40,11 @@ services:
       - kvraft-net
 
   # ============================================================
-  # KVraft Raft 集群节点 (3 节点)
+  # KVraft Raft 集群（3 节点，单 Group）
+  # 多 Group 分片模式见文档末尾注释
   # ============================================================
 
-  # Node 0 - Raft Group 0
+  # Node 0
   kvraft-node-0:
     build:
       context: ..
@@ -67,20 +52,19 @@ services:
     container_name: kvraft-node-0
     environment:
       - NODE_ID=0
-      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50001,kvraft-node-2:50002
+      - GROUP_ID=1
+      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50000,kvraft-node-2:50000
       - GRPC_LISTEN=0.0.0.0:6000
       - REST_LISTEN=0.0.0.0:8001
       - METRICS_LISTEN=0.0.0.0:9100
       - LOG_LEVEL=info
     ports:
-      - "50000:50000"  # Raft 通信端口
-      - "6000:6000"    # gRPC 端口
-      - "8001:8001"    # REST API 端口（可选旧接口）
+      - "50000:50000"  # Raft RPC
+      - "6000:6000"    # gRPC
+      - "8001:8001"    # REST /health
       - "9100:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-0:/data
-    depends_on:
-      - consul
     networks:
       - kvraft-net
     healthcheck:
@@ -90,7 +74,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # Node 1 - Raft Group 0
+  # Node 1
   kvraft-node-1:
     build:
       context: ..
@@ -98,20 +82,19 @@ services:
     container_name: kvraft-node-1
     environment:
       - NODE_ID=1
-      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50001,kvraft-node-2:50002
+      - GROUP_ID=1
+      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50000,kvraft-node-2:50000
       - GRPC_LISTEN=0.0.0.0:6000
       - REST_LISTEN=0.0.0.0:8001
       - METRICS_LISTEN=0.0.0.0:9100
       - LOG_LEVEL=info
     ports:
-      - "50001:50000"  # Raft 通信端口
-      - "6001:6000"    # gRPC 端口
-      - "8002:8001"    # REST API 端口
+      - "50001:50000"  # Raft RPC
+      - "6001:6000"    # gRPC
+      - "8002:8001"    # REST /health
       - "9101:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-1:/data
-    depends_on:
-      - consul
     networks:
       - kvraft-net
     healthcheck:
@@ -121,7 +104,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # Node 2 - Raft Group 0
+  # Node 2
   kvraft-node-2:
     build:
       context: ..
@@ -129,20 +112,19 @@ services:
     container_name: kvraft-node-2
     environment:
       - NODE_ID=2
-      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50001,kvraft-node-2:50002
+      - GROUP_ID=1
+      - RAFT_PEERS=kvraft-node-0:50000,kvraft-node-1:50000,kvraft-node-2:50000
       - GRPC_LISTEN=0.0.0.0:6000
       - REST_LISTEN=0.0.0.0:8001
       - METRICS_LISTEN=0.0.0.0:9100
       - LOG_LEVEL=info
     ports:
-      - "50002:50000"  # Raft 通信端口
-      - "6002:6000"    # gRPC 端口
-      - "8003:8001"    # REST API 端口
+      - "50002:50000"  # Raft RPC
+      - "6002:6000"    # gRPC
+      - "8003:8001"    # REST /health
       - "9102:9100"    # Prometheus metrics
     volumes:
       - kvraft-data-2:/data
-    depends_on:
-      - consul
     networks:
       - kvraft-net
     healthcheck:
@@ -153,58 +135,38 @@ services:
       start_period: 10s
 
   # ============================================================
-  # 性能测试工具
+  # 性能测试（按需启动：docker compose --profile benchmark up benchmark）
   # ============================================================
 
-  # Redis 基准测试服务器（用于对比）
-  redis:
-    image: redis:7-alpine
-    container_name: kvraft-redis
-    ports:
-      - "6379:6379"
-    networks:
-      - kvraft-net
-    command: redis-server --appendonly yes --appendfsync everysec
-
-  # Benchmark 客户端容器
   benchmark:
     build:
       context: ..
       dockerfile: deployments/Dockerfile.benchmark
     container_name: kvraft-benchmark
     environment:
-      - TARGET_NODES=kvraft-node-0:6000,kvraft-node-1:6001,kvraft-node-2:6002
-      - BENCHMARK_TYPE=write  # read, write, mixed
-      - NUM_CLIENTS=10
-      - NUM_REQUESTS=10000
-      - REDIS_ADDR=redis:6379
-      - DURATION=30s
+      - TARGET_NODES=${TARGET_NODES:-kvraft-node-0:6000,kvraft-node-1:6000,kvraft-node-2:6000}
+      - BENCHMARK_TYPE=${BENCHMARK_TYPE:-mixed}
+      - NUM_CLIENTS=${NUM_CLIENTS:-10}
+      - NUM_REQUESTS=${NUM_REQUESTS:-10000}
+      - READ_RATIO=${READ_RATIO:-0.5}
+      - DURATION=${DURATION:-30s}
     depends_on:
       - kvraft-node-0
       - kvraft-node-1
       - kvraft-node-2
-      - redis
     networks:
       - kvraft-net
     profiles:
-      - benchmark  # 启动 benchmark: docker-compose --profile benchmark up
+      - benchmark
     command:
       - /bin/sh
       - -lc
       - |
         case "$BENCHMARK_TYPE" in
-          read)
-            READ_RATIO=1.0
-            ;;
-          write)
-            READ_RATIO=0.0
-            ;;
-          mixed)
-            READ_RATIO=${READ_RATIO:-0.5}
-            ;;
-          *)
-            READ_RATIO=${READ_RATIO:-0.5}
-            ;;
+          read)  READ_RATIO=1.0 ;;
+          write) READ_RATIO=0.0 ;;
+          mixed) READ_RATIO=${READ_RATIO:-0.5} ;;
+          *)     READ_RATIO=${READ_RATIO:-0.5} ;;
         esac
         exec /app/benchmark \
           -server-addrs="$TARGET_NODES" \
@@ -215,16 +177,32 @@ services:
           -sharded=false
 
 # ============================================================
-# 网络配置
+# 多 Group 分片模式（示例：2 Group × 3 Replica = 6 节点）
+# 取消注释替换上面的单 Group 节点定义即可：
+#
+#   kvraft-g0-node-0:
+#     ...
+#     environment:
+#       - NODE_ID=0
+#       - GROUP_ID=1
+#       - RAFT_PEERS=kvraft-g0-node-0:50000,kvraft-g0-node-1:50000,kvraft-g0-node-2:50000
+#     ports: ["50000:50000", "6000:6000", ...]
+#
+#   kvraft-g1-node-0:
+#     ...
+#     environment:
+#       - NODE_ID=0
+#       - GROUP_ID=2
+#       - RAFT_PEERS=kvraft-g1-node-0:50100,kvraft-g1-node-1:50100,kvraft-g1-node-2:50100
+#     ports: ["50100:50000", "6100:6000", ...]
+#
+# 注意：不同 Group 使用不同的容器内部端口号（如 G1=50000, G2=50100），
+# 避免在同一 overlay 网络中端口冲突。
 # ============================================================
 
 networks:
   kvraft-net:
     driver: bridge
-
-# ============================================================
-# 数据卷配置
-# ============================================================
 
 volumes:
   kvraft-data-0:

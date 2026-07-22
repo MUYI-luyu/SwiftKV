@@ -3,7 +3,6 @@ package kv
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,25 +60,12 @@ func (s *WatchSubscription) Cancel() {
 	}
 }
 
-func toGRPCAddress(raftAddr string) string {
-	parts := strings.Split(raftAddr, ":")
-	if len(parts) != 2 {
-		return raftAddr
-	}
-	p, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return raftAddr
-	}
-	return fmt.Sprintf("%s:%d", parts[0], p+1000)
-}
 
 // MakeClerk 创建单 Raft 组的 Clerk。内部使用 ShardRouter（1 group），
 // 所有方法走统一的分片路由路径，不再区分 classic/sharded 代码分支。
 func MakeClerk(servers []string) *Clerk {
 	grpcAddrs := make([]string, len(servers))
-	for i, s := range servers {
-		grpcAddrs[i] = toGRPCAddress(s)
-	}
+	copy(grpcAddrs, servers)
 
 	cfg := sharding.ShardingConfig{
 		Groups: []sharding.RaftGroupConfig{{
